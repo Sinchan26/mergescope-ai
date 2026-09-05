@@ -1,25 +1,30 @@
 # MergeScope AI
 
-MergeScope AI is a Docker-free pull-request review workspace. It fetches a GitHub PR, asks an OpenAI model for a structured review, stores the result in SQLite, and presents the review in a focused React dashboard.
+MergeScope AI is a Docker-free, grounded pull-request review workspace. It fetches a GitHub PR,
+runs specialized reviewers through a LangGraph workflow, validates every finding against the exact
+added lines, stores the result in SQLite, and presents the evidence in a React dashboard.
 
-The first milestone is intentionally safe: reviews run in **dry-run mode** and never post comments back to GitHub.
+Reviews remain in **dry-run mode**: the application never writes comments to GitHub.
 
-## What is included
+## Phase 2 capabilities
 
-- FastAPI API with health, configuration, manual review, history, and detail endpoints
-- React + Vite dashboard served separately in development and by FastAPI after a production build
-- GitHub REST integration; a token is optional for public repositories
-- OpenAI Responses API with a typed review schema
-- SQLite persistence with no Redis, Jira, or Docker requirement
-- Optional ticket reference field, ready for a future Jira or local-ticket provider
-- Automated backend tests with mocked GitHub and OpenAI clients
+- Code and testing reviewers, with a security reviewer routed only for sensitive changes
+- OpenAI Responses API with strict Pydantic structured outputs
+- Deterministic synthesis guardrail: invalid paths, missing lines, non-added lines, and duplicates
+  are rejected before the verdict is calculated
+- Repository guidance from `AGENTS.md`, `CONTRIBUTING.md`, and the pull-request template
+- Local Markdown/text knowledge base using OpenAI embeddings and SQLite retrieval
+- Review cache keyed by repository, PR number, head SHA, and prompt version
+- Deterministic demo mode requiring neither GitHub nor OpenAI credentials
+- Dashboard views for review agents, context sources, cache state, and validated diff excerpts
+- No Docker, Redis, vector database, or Jira dependency
 
 ## Prerequisites
 
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/)
 - Node.js 20+
-- An OpenAI API key
+- An OpenAI API key for live reviews and document indexing
 - Optional: a GitHub token for private repositories or higher rate limits
 
 ## Local setup
@@ -34,9 +39,8 @@ cd frontend
 npm install
 ```
 
-On PowerShell, use `Copy-Item .env.example .env` instead of `cp`.
-
-Set `OPENAI_API_KEY` in `.env`, then run the two development servers in separate terminals:
+On PowerShell, use `Copy-Item .env.example .env` instead of `cp`. Set `OPENAI_API_KEY` in `.env`
+for live reviews. Then run these commands in separate terminals:
 
 ```bash
 uv run uvicorn mergescope.main:app --app-dir backend/src --reload --port 8000
@@ -47,21 +51,28 @@ cd frontend
 npm run dev
 ```
 
-Open [http://localhost:5173](http://localhost:5173). The Vite server proxies `/api` requests to FastAPI.
+Open [http://localhost:5173](http://localhost:5173). Vite proxies `/api` to FastAPI.
 
-## Test without Jira
+## Test without Jira or API keys
 
-Jira is not required. Leave **Ticket reference** blank, or enter a label such as `LOCAL-101` to test that optional metadata is preserved. MergeScope does not contact Jira in this milestone.
+Jira is not required. Leave **Ticket reference** blank or use a local label such as `LOCAL-101`.
 
-Use a public pull request URL, keep **Dry run** enabled, and submit the review. A GitHub token is not required for a public repository, although unauthenticated requests have a lower rate limit.
+To test without any credentials, click **Run deterministic demo**. It exercises the same diff
+validator, storage, history, and dashboard result views using a fixed synthetic PR. For a live run,
+set `OPENAI_API_KEY`, submit a public PR URL, and optionally set `GITHUB_TOKEN`.
+
+Use **Knowledge base** to index `.md`, `.markdown`, or `.txt` guidance files up to 1 MB. Indexing
+uses `text-embedding-3-small`; the text and vectors remain in the local SQLite database.
 
 ## Validation
 
 ```bash
-uv run pytest
+uv run ruff format --check backend
 uv run ruff check backend
+uv run pytest
 cd frontend
 npm run build
+npm audit --audit-level=high
 ```
 
 ## Single-server production build
@@ -73,23 +84,29 @@ cd ..
 uv run uvicorn mergescope.main:app --app-dir backend/src --host 0.0.0.0 --port 8000
 ```
 
-FastAPI detects `frontend/dist` and serves the dashboard at [http://localhost:8000](http://localhost:8000).
+FastAPI detects `frontend/dist` and serves the dashboard at
+[http://localhost:8000](http://localhost:8000).
 
 ## API endpoints
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/health` | Service and integration readiness |
+| `GET` | `/api/health` | Service, integration, and document readiness |
 | `GET` | `/api/config` | Safe client configuration |
 | `GET` | `/api/reviews` | Recent review runs |
-| `GET` | `/api/reviews/{review_id}` | Complete review result |
-| `POST` | `/api/reviews/manual` | Run a dry-run review for a GitHub PR URL |
+| `GET` | `/api/reviews/{review_id}` | Complete grounded review result |
+| `POST` | `/api/reviews/manual` | Run a live or deterministic demo review |
+| `GET` | `/api/knowledge/documents` | List indexed guidance documents |
+| `POST` | `/api/knowledge/documents` | Index a Markdown or text document |
+| `DELETE` | `/api/knowledge/documents/{document_id}` | Delete a document and its chunks |
 
 Interactive API documentation is available at `/docs`.
 
 ## Safety boundaries
 
-- Pull-request content is treated as untrusted input; instructions found inside code or comments are ignored.
+- PRs and uploaded guidance are treated as untrusted data; embedded instructions are ignored.
+- Findings without a valid added-line anchor are excluded from the result.
+- The deterministic validator, not the model synthesizer, calculates the final verdict.
 - Secrets are loaded only from environment variables and are never returned by the API.
-- GitHub write operations are not implemented in this milestone.
-- Large diffs are truncated deterministically before being sent to the model.
+- GitHub write operations do not exist in Phase 2.
+- Diffs are truncated deterministically before model submission.

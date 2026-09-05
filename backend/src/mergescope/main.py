@@ -6,11 +6,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+from mergescope.agents.review_graph import ReviewOrchestrator
 from mergescope.api.routes import router
 from mergescope.core.config import get_settings
 from mergescope.db.repository import ReviewRepository
+from mergescope.integrations.embeddings import OpenAIEmbedder
 from mergescope.integrations.github import GitHubClient
-from mergescope.integrations.openai_review import OpenAIReviewer
+from mergescope.integrations.openai_review import OpenAIReviewClient
+from mergescope.services.knowledge import KnowledgeRetriever, KnowledgeService
 from mergescope.services.reviews import ReviewService
 
 settings = get_settings()
@@ -25,8 +28,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         token=settings.github_token,
         timeout_seconds=settings.github_timeout_seconds,
     )
-    reviewer = (
-        OpenAIReviewer(
+    embedder = (
+        OpenAIEmbedder(
+            api_key=settings.openai_api_key,
+            model=settings.openai_embedding_model,
+            dimensions=settings.embedding_dimensions,
+        )
+        if settings.openai_api_key
+        else None
+    )
+    review_client = (
+        OpenAIReviewClient(
             api_key=settings.openai_api_key,
             model=settings.openai_model,
             max_diff_chars=settings.max_diff_chars,
@@ -34,13 +46,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.openai_api_key
         else None
     )
+    knowledge_service = KnowledgeService(
+        repository=repository,
+        embedder=embedder,
+        embedding_model=settings.openai_embedding_model,
+        max_document_bytes=settings.max_document_bytes,
+    )
+    retriever = KnowledgeRetriever(repository=repository, embedder=embedder)
     app.state.repository = repository
+    app.state.knowledge_service = knowledge_service
     app.state.review_service = ReviewService(
         repository=repository,
         github=github,
-        reviewer=reviewer,
+        orchestrator=ReviewOrchestrator(review_client) if review_client else None,
+        retriever=retriever,
         model=settings.openai_model,
         dry_run_only=settings.dry_run_only,
+        demo_mode_allowed=settings.demo_mode_allowed,
+        prompt_version=settings.prompt_version,
     )
     yield
     await github.close()
@@ -48,8 +71,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.1.0",
-    description="Docker-free AI pull-request review API",
+    version="0.2.0",
+    description="Grounded, Docker-free multi-agent pull-request review API",
     lifespan=lifespan,
 )
 app.add_middleware(
@@ -60,7 +83,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(router, prefix=settings.api_prefix)
-
 
 frontend_dist = settings.resolved_frontend_dist_path
 if frontend_dist.joinpath("index.html").exists():

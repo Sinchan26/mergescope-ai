@@ -3,21 +3,23 @@ from pathlib import Path
 import pytest
 from mergescope.db.repository import ReviewRepository
 from mergescope.domain.models import (
+    AgentRole,
     Approval,
-    Category,
+    ContextSource,
     ManualReviewRequest,
     PullRequestFile,
     PullRequestSnapshot,
-    ReviewIssue,
     ReviewResult,
     ReviewStatus,
-    Severity,
 )
 from mergescope.services.reviews import ReviewService
 
 
 class FakeGitHub:
+    fetch_calls = 0
+
     async def fetch_pull_request(self, url: str) -> PullRequestSnapshot:
+        self.fetch_calls += 1
         return PullRequestSnapshot(
             repository="example/project",
             number=7,
@@ -31,48 +33,48 @@ class FakeGitHub:
                 PullRequestFile(
                     filename="src/parser.py",
                     status="modified",
-                    additions=3,
-                    deletions=1,
-                    changes=4,
-                    patch="@@ -1 +1,3 @@",
+                    additions=1,
+                    deletions=0,
+                    changes=1,
+                    patch="@@ -2,1 +2,2 @@\n value = read()\n+validate(value)",
                 )
             ],
         )
 
+    async def fetch_repository_guidance(
+        self, pull_request: PullRequestSnapshot
+    ) -> list[ContextSource]:
+        return [
+            ContextSource(
+                source_id="repository:AGENTS.md",
+                name="AGENTS.md",
+                source_type="repository_guidance",
+                excerpt="Validate all external input.",
+            )
+        ]
 
-class FakeReviewer:
-    async def review(
-        self, pull_request: PullRequestSnapshot, ticket_reference: str | None
-    ) -> tuple[ReviewResult, int, int, int]:
+
+class FakeRetriever:
+    async def retrieve(self, query: str) -> list[ContextSource]:
+        return []
+
+
+class FakeOrchestrator:
+    calls = 0
+
+    async def run(self, pull_request, context_sources, parsed_patches, ticket_reference):
+        self.calls += 1
         return (
             ReviewResult(
-                summary="One actionable issue was found.",
-                approval=Approval.comment,
-                confidence=0.91,
-                issues=[
-                    ReviewIssue(
-                        file_path="src/parser.py",
-                        line_number=3,
-                        severity=Severity.medium,
-                        category=Category.testing,
-                        title="Missing regression test",
-                        message="The new empty-input behavior is not covered.",
-                        evidence="The patch changes the guard without a test file change.",
-                        suggestion="Add a test for empty input.",
-                    ),
-                    ReviewIssue(
-                        file_path="invented.py",
-                        severity=Severity.high,
-                        category=Category.correctness,
-                        title="Invented path",
-                        message="This must be filtered.",
-                        evidence="None.",
-                        suggestion="None.",
-                    ),
-                ],
-                positive_notes=["The guard is easy to read."],
+                summary="The change is safe to merge.",
+                approval=Approval.approve,
+                confidence=0.9,
+                issues=[],
+                positive_notes=["Input validation is explicit."],
                 reviewed_files=["src/parser.py"],
                 skipped_files=[],
+                agents_run=[AgentRole.code, AgentRole.testing, AgentRole.synthesizer],
+                context_sources=context_sources,
             ),
             120,
             80,
@@ -80,42 +82,73 @@ class FakeReviewer:
         )
 
 
-async def test_manual_review_is_persisted_and_invalid_paths_are_removed(tmp_path: Path) -> None:
+def build_service(tmp_path: Path, orchestrator=None) -> tuple[ReviewService, ReviewRepository]:
     repository = ReviewRepository(tmp_path / "reviews.db")
-    await repository.initialize()
     service = ReviewService(
         repository=repository,
         github=FakeGitHub(),  # type: ignore[arg-type]
-        reviewer=FakeReviewer(),  # type: ignore[arg-type]
+        orchestrator=orchestrator,
+        retriever=FakeRetriever(),  # type: ignore[arg-type]
         model="test-model",
         dry_run_only=True,
+        demo_mode_allowed=True,
+        prompt_version="test-v1",
+    )
+    return service, repository
+
+
+async def test_manual_review_is_persisted_and_reused_from_cache(tmp_path: Path) -> None:
+    orchestrator = FakeOrchestrator()
+    service, repository = build_service(tmp_path, orchestrator)
+    await repository.initialize()
+    request = ManualReviewRequest(pr_url="https://github.com/example/project/pull/7")
+
+    first = await service.run_manual_review(request)
+    second = await service.run_manual_review(request)
+
+    assert first.status is ReviewStatus.completed
+    assert first.repository == "example/project"
+    assert first.cache_hit is False
+    assert second.cache_hit is True
+    assert second.cached_from_id == first.id
+    assert second.input_tokens == 0
+    assert orchestrator.calls == 1
+    assert (await repository.list()).total == 2
+
+
+async def test_force_rereview_bypasses_cache(tmp_path: Path) -> None:
+    orchestrator = FakeOrchestrator()
+    service, repository = build_service(tmp_path, orchestrator)
+    await repository.initialize()
+    await service.run_manual_review(
+        ManualReviewRequest(pr_url="https://github.com/example/project/pull/7")
     )
 
-    run = await service.run_manual_review(
-        ManualReviewRequest(
-            pr_url="https://github.com/example/project/pull/7",
-            ticket_reference="LOCAL-7",
-        )
+    rerun = await service.run_manual_review(
+        ManualReviewRequest(pr_url="https://github.com/example/project/pull/7", force_rereview=True)
     )
+
+    assert rerun.cache_hit is False
+    assert orchestrator.calls == 2
+
+
+async def test_demo_review_needs_no_github_or_openai_configuration(tmp_path: Path) -> None:
+    service, repository = build_service(tmp_path, orchestrator=None)
+    await repository.initialize()
+
+    run = await service.run_manual_review(ManualReviewRequest(demo_mode=True))
 
     assert run.status is ReviewStatus.completed
-    assert run.repository == "example/project"
-    assert run.issue_count == 1
+    assert run.demo_mode is True
+    assert run.model == "demo-fixture"
     assert run.result is not None
-    assert run.result.issues[0].file_path == "src/parser.py"
-    assert (await repository.get(run.id)).status is ReviewStatus.completed  # type: ignore[union-attr]
+    assert AgentRole.security in run.result.agents_run
+    assert all(issue.line_validated for issue in run.result.issues)
 
 
-async def test_openai_key_is_required_before_a_run_is_created(tmp_path: Path) -> None:
-    repository = ReviewRepository(tmp_path / "reviews.db")
+async def test_openai_key_is_required_before_a_live_run_is_created(tmp_path: Path) -> None:
+    service, repository = build_service(tmp_path, orchestrator=None)
     await repository.initialize()
-    service = ReviewService(
-        repository=repository,
-        github=FakeGitHub(),  # type: ignore[arg-type]
-        reviewer=None,
-        model="test-model",
-        dry_run_only=True,
-    )
 
     with pytest.raises(ValueError, match="OPENAI_API_KEY"):
         await service.run_manual_review(
