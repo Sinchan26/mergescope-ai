@@ -1,23 +1,25 @@
 # MergeScope AI
 
-MergeScope AI is a Docker-free, grounded pull-request review workspace. It fetches a GitHub PR,
-runs specialized reviewers through a LangGraph workflow, validates every finding against the exact
-added lines, stores the result in SQLite, and presents the evidence in a React dashboard.
+MergeScope AI is a Docker-free pull-request review workspace. It retrieves GitHub changes and local
+guidance, runs specialized OpenAI reviewers through LangGraph, validates every finding against the
+exact added lines, and stores durable review workflows in SQLite.
 
-Reviews remain in **dry-run mode**: the application never writes comments to GitHub.
+Phase 3 adds signed GitHub App automation. Webhooks only enqueue persistent work; publishing remains
+locked until it is enabled on the server and explicitly confirmed from a comment preview.
 
-## Phase 2 capabilities
+## Capabilities
 
-- Code and testing reviewers, with a security reviewer routed only for sensitive changes
-- OpenAI Responses API with strict Pydantic structured outputs
-- Deterministic synthesis guardrail: invalid paths, missing lines, non-added lines, and duplicates
-  are rejected before the verdict is calculated
-- Repository guidance from `AGENTS.md`, `CONTRIBUTING.md`, and the pull-request template
-- Local Markdown/text knowledge base using OpenAI embeddings and SQLite retrieval
-- Review cache keyed by repository, PR number, head SHA, and prompt version
-- Deterministic demo mode requiring neither GitHub nor OpenAI credentials
-- Dashboard views for review agents, context sources, cache state, and validated diff excerpts
-- No Docker, Redis, vector database, or Jira dependency
+- Code and testing reviewers with conditional security review and synthesis
+- OpenAI Responses structured outputs and `text-embedding-3-small` knowledge retrieval
+- Deterministic validation of changed paths, added lines, duplicates, and final verdicts
+- Repository guidance from `AGENTS.md`, `CONTRIBUTING.md`, and PR templates
+- SQLite review cache, local knowledge vectors, webhook deliveries, and durable jobs
+- GitHub App RS256 authentication with cached installation tokens
+- HMAC-SHA256 webhook verification before payload parsing
+- Delivery-ID and PR-head idempotency, retry backoff, worker leases, and stale-head supersession
+- Comment preview with a second head-SHA check and explicit publish confirmation
+- Deterministic demo mode requiring no GitHub, Jira, or OpenAI credentials
+- No Docker, Redis, external queue, vector database, or Jira dependency
 
 ## Prerequisites
 
@@ -25,7 +27,8 @@ Reviews remain in **dry-run mode**: the application never writes comments to Git
 - [uv](https://docs.astral.sh/uv/)
 - Node.js 20+
 - An OpenAI API key for live reviews and document indexing
-- Optional: a GitHub token for private repositories or higher rate limits
+- Optional GitHub App for webhooks, private repositories, and comment publishing
+- Optional GitHub token for manual private-repository reviews
 
 ## Local setup
 
@@ -40,7 +43,7 @@ npm install
 ```
 
 On PowerShell, use `Copy-Item .env.example .env` instead of `cp`. Set `OPENAI_API_KEY` in `.env`
-for live reviews. Then run these commands in separate terminals:
+for live reviews, then run these commands in separate terminals:
 
 ```bash
 uv run uvicorn mergescope.main:app --app-dir backend/src --reload --port 8000
@@ -51,18 +54,17 @@ cd frontend
 npm run dev
 ```
 
-Open [http://localhost:5173](http://localhost:5173). Vite proxies `/api` to FastAPI.
+Open [http://localhost:5173](http://localhost:5173). Vite proxies `/api` to FastAPI. The application
+starts its SQLite-backed worker in the FastAPI process, so no additional server is required.
 
 ## Test without Jira or API keys
 
-Jira is not required. Leave **Ticket reference** blank or use a local label such as `LOCAL-101`.
+Jira is not required. Leave **Ticket reference** blank or enter a local label such as `LOCAL-101`.
+Click **Run deterministic demo** to exercise validation, storage, history, and review inspection
+without credentials. Demo reviews cannot be published.
 
-To test without any credentials, click **Run deterministic demo**. It exercises the same diff
-validator, storage, history, and dashboard result views using a fixed synthetic PR. For a live run,
-set `OPENAI_API_KEY`, submit a public PR URL, and optionally set `GITHUB_TOKEN`.
-
-Use **Knowledge base** to index `.md`, `.markdown`, or `.txt` guidance files up to 1 MB. Indexing
-uses `text-embedding-3-small`; the text and vectors remain in the local SQLite database.
+For live review automation, follow [GitHub App setup](docs/GITHUB_APP_SETUP.md). Keep
+`GITHUB_PUBLISHING_ENABLED=false` while testing webhooks and the job queue.
 
 ## Validation
 
@@ -84,29 +86,34 @@ cd ..
 uv run uvicorn mergescope.main:app --app-dir backend/src --host 0.0.0.0 --port 8000
 ```
 
-FastAPI detects `frontend/dist` and serves the dashboard at
-[http://localhost:8000](http://localhost:8000).
+FastAPI serves `frontend/dist` at [http://localhost:8000](http://localhost:8000).
 
 ## API endpoints
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/health` | Service, integration, and document readiness |
-| `GET` | `/api/config` | Safe client configuration |
+| `GET` | `/api/health` | Integration, worker, queue, and storage readiness |
+| `GET` | `/api/config` | Safe client configuration without secrets |
 | `GET` | `/api/reviews` | Recent review runs |
-| `GET` | `/api/reviews/{review_id}` | Complete grounded review result |
-| `POST` | `/api/reviews/manual` | Run a live or deterministic demo review |
-| `GET` | `/api/knowledge/documents` | List indexed guidance documents |
-| `POST` | `/api/knowledge/documents` | Index a Markdown or text document |
-| `DELETE` | `/api/knowledge/documents/{document_id}` | Delete a document and its chunks |
+| `POST` | `/api/reviews/manual` | Run a manual live or deterministic demo review |
+| `GET` | `/api/reviews/{id}/publication-preview` | Preview the exact GitHub review payload |
+| `POST` | `/api/reviews/{id}/publish` | Publish after literal `confirm: true` validation |
+| `GET` | `/api/jobs` | Inspect durable webhook review jobs |
+| `POST` | `/api/webhooks/github` | Receive signed GitHub App deliveries |
+| `GET/POST` | `/api/knowledge/documents` | List or index local guidance |
+| `DELETE` | `/api/knowledge/documents/{id}` | Delete a document and its chunks |
 
 Interactive API documentation is available at `/docs`.
 
 ## Safety boundaries
 
-- PRs and uploaded guidance are treated as untrusted data; embedded instructions are ignored.
-- Findings without a valid added-line anchor are excluded from the result.
-- The deterministic validator, not the model synthesizer, calculates the final verdict.
-- Secrets are loaded only from environment variables and are never returned by the API.
-- GitHub write operations do not exist in Phase 2.
-- Diffs are truncated deterministically before model submission.
+- Webhook signatures are verified with a constant-time comparison before JSON parsing.
+- Duplicate delivery IDs and duplicate repository/PR/head/prompt combinations reuse one job.
+- Worker jobs are leased, retried with backoff, and recover after process restarts.
+- Stale webhook heads are superseded; stale reviewed heads cannot be published.
+- Only deterministic, line-validated findings become inline comments.
+- GitHub publishing defaults to disabled and requires an explicit preview confirmation.
+- The write endpoint additionally requires a server-side operator token entered at confirmation.
+- Publication uses a hidden idempotency marker to recover from ambiguous network failures.
+- Published reviews use GitHub's non-approving `COMMENT` event.
+- Secrets and private keys are never returned by the API; `.env` and `*.pem` are ignored by Git.

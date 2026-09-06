@@ -10,7 +10,8 @@ import {
   SearchCode,
   ShieldCheck,
 } from "lucide-react";
-import type { AgentRole, ReviewRun } from "../types";
+import type { AgentRole, PublicationResult, ReviewRun } from "../types";
+import { PublicationPanel } from "./PublicationPanel";
 import { StatusBadge, humanize } from "./StatusBadge";
 
 const agentLabels: Record<AgentRole, string> = {
@@ -20,7 +21,13 @@ const agentLabels: Record<AgentRole, string> = {
   review_synthesizer: "Synthesizer",
 };
 
-export function ReviewInspector({ selected }: { selected: ReviewRun | null }) {
+export function ReviewInspector({
+  selected,
+  onPublished,
+}: {
+  selected: ReviewRun | null;
+  onPublished: (result: PublicationResult) => void;
+}) {
   if (!selected) {
     return (
       <aside className="panel inspector" aria-label="Selected review details">
@@ -58,6 +65,8 @@ export function ReviewInspector({ selected }: { selected: ReviewRun | null }) {
             <div><Activity size={15} /><span>Confidence</span><strong>{Math.round(selected.result.confidence * 100)}%</strong></div>
             <div><FileCode2 size={15} /><span>Files</span><strong>{selected.result.reviewed_files.length}</strong></div>
           </div>
+
+          <PublicationPanel review={selected} onPublished={onPublished} />
 
           <div className="detail-block">
             <div className="issue-list-heading"><h3>Agents executed</h3><span>{selected.result.agents_run.length}</span></div>

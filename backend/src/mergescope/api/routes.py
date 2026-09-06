@@ -1,9 +1,11 @@
+import secrets
 from typing import Annotated
 
 from fastapi import (
     APIRouter,
     Depends,
     File,
+    Header,
     HTTPException,
     Query,
     Request,
@@ -19,14 +21,21 @@ from mergescope.domain.models import (
     KnowledgeDocument,
     KnowledgeDocumentList,
     ManualReviewRequest,
+    PublicationPreview,
+    PublicationResult,
     PublicConfig,
+    PublishReviewRequest,
+    ReviewJobList,
     ReviewList,
     ReviewRun,
+    WebhookReceipt,
 )
 from mergescope.integrations.github import GitHubError
 from mergescope.integrations.openai_review import OpenAIReviewError
 from mergescope.services.knowledge import KnowledgeService
+from mergescope.services.publication import PublicationError, PublicationService
 from mergescope.services.reviews import ReviewService
+from mergescope.services.webhooks import WebhookError, WebhookService
 
 router = APIRouter()
 
@@ -43,9 +52,19 @@ def get_knowledge_service(request: Request) -> KnowledgeService:
     return request.app.state.knowledge_service
 
 
+def get_webhook_service(request: Request) -> WebhookService:
+    return request.app.state.webhook_service
+
+
+def get_publication_service(request: Request) -> PublicationService:
+    return request.app.state.publication_service
+
+
 RepositoryDep = Annotated[ReviewRepository, Depends(get_repository)]
 ReviewServiceDep = Annotated[ReviewService, Depends(get_review_service)]
 KnowledgeServiceDep = Annotated[KnowledgeService, Depends(get_knowledge_service)]
+WebhookServiceDep = Annotated[WebhookService, Depends(get_webhook_service)]
+PublicationServiceDep = Annotated[PublicationService, Depends(get_publication_service)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 
 
@@ -56,7 +75,14 @@ async def health(repository: RepositoryDep, settings: SettingsDep) -> HealthResp
         status="ready" if database_ready else "degraded",
         database="connected" if database_ready else "unavailable",
         openai_configured=bool(settings.openai_api_key),
-        github_configured=bool(settings.github_token),
+        github_configured=bool(settings.github_token or settings.github_app_ready),
+        github_app_configured=settings.github_app_ready,
+        webhook_configured=bool(settings.github_webhook_secret),
+        worker_enabled=settings.worker_enabled,
+        pending_jobs=await repository.pending_job_count() if database_ready else 0,
+        publishing_enabled=bool(
+            settings.github_publishing_enabled and settings.publish_confirmation_token
+        ),
         knowledge_documents=await repository.document_count() if database_ready else 0,
         dry_run_only=settings.dry_run_only,
         demo_mode_allowed=settings.demo_mode_allowed,
@@ -71,7 +97,13 @@ async def public_config(settings: SettingsDep) -> PublicConfig:
         openai_model=settings.openai_model,
         embedding_model=settings.openai_embedding_model,
         openai_configured=bool(settings.openai_api_key),
-        github_configured=bool(settings.github_token),
+        github_configured=bool(settings.github_token or settings.github_app_ready),
+        github_app_configured=settings.github_app_ready,
+        webhook_configured=bool(settings.github_webhook_secret),
+        worker_enabled=settings.worker_enabled,
+        publishing_enabled=bool(
+            settings.github_publishing_enabled and settings.publish_confirmation_token
+        ),
         dry_run_only=settings.dry_run_only,
         demo_mode_allowed=settings.demo_mode_allowed,
         prompt_version=settings.prompt_version,
@@ -95,6 +127,47 @@ async def get_review(review_id: str, repository: RepositoryDep) -> ReviewRun:
     return review
 
 
+@router.get("/reviews/{review_id}/publication-preview", response_model=PublicationPreview)
+async def publication_preview(
+    review_id: str,
+    repository: RepositoryDep,
+    service: PublicationServiceDep,
+) -> PublicationPreview:
+    review = await repository.get(review_id)
+    if review is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review not found.")
+    return service.preview(review)
+
+
+@router.post("/reviews/{review_id}/publish", response_model=PublicationResult)
+async def publish_review(
+    review_id: str,
+    payload: PublishReviewRequest,
+    service: PublicationServiceDep,
+    settings: SettingsDep,
+    publish_token: Annotated[str | None, Header(alias="X-MergeScope-Publish-Token")] = None,
+) -> PublicationResult:
+    if payload.confirm is not True:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Confirmation required."
+        )
+    expected = settings.publish_confirmation_token
+    if not settings.github_publishing_enabled or not expected:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="GitHub publishing is not fully enabled on this server.",
+        )
+    if publish_token is None or not secrets.compare_digest(publish_token, expected):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="The publication confirmation token is missing or incorrect.",
+        )
+    try:
+        return await service.publish(review_id)
+    except PublicationError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+
 @router.post("/reviews/manual", response_model=ReviewRun, status_code=status.HTTP_201_CREATED)
 async def manual_review(
     payload: ManualReviewRequest,
@@ -106,6 +179,42 @@ async def manual_review(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except OpenAIReviewError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+
+@router.get("/jobs", response_model=ReviewJobList)
+async def list_jobs(
+    repository: RepositoryDep,
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+) -> ReviewJobList:
+    return await repository.list_jobs(limit=limit)
+
+
+@router.post(
+    "/webhooks/github", response_model=WebhookReceipt, status_code=status.HTTP_202_ACCEPTED
+)
+async def github_webhook(request: Request, service: WebhookServiceDep) -> WebhookReceipt:
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > service.max_body_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="Webhook payload exceeds the configured size limit.",
+            )
+    try:
+        return await service.ingest(
+            delivery_id=request.headers.get("X-GitHub-Delivery"),
+            event_name=request.headers.get("X-GitHub-Event"),
+            signature=request.headers.get("X-Hub-Signature-256"),
+            body=bytes(body),
+        )
+    except WebhookError as exc:
+        status_code = (
+            status.HTTP_401_UNAUTHORIZED
+            if "signature" in str(exc).lower()
+            else status.HTTP_400_BAD_REQUEST
+        )
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
 
 @router.get("/knowledge/documents", response_model=KnowledgeDocumentList)

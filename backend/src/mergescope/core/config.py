@@ -12,6 +12,7 @@ class Settings(BaseSettings):
         env_file=PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        env_ignore_empty=True,
         extra="ignore",
     )
 
@@ -27,12 +28,24 @@ class Settings(BaseSettings):
     embedding_dimensions: int = Field(default=256, ge=64, le=1536)
     github_token: str | None = None
     github_api_url: str = "https://api.github.com"
+    github_api_version: str = "2026-03-10"
+    github_app_id: str | None = None
+    github_app_private_key_path: Path | None = None
+    github_app_private_key: str | None = None
+    github_webhook_secret: str | None = None
+    github_publishing_enabled: bool = False
+    publish_confirmation_token: str | None = None
+    worker_enabled: bool = True
+    worker_poll_seconds: float = Field(default=2.0, ge=0.25, le=60)
+    worker_max_attempts: int = Field(default=3, ge=1, le=10)
+    worker_lease_seconds: int = Field(default=300, ge=30, le=3_600)
+    webhook_max_bytes: int = Field(default=1_000_000, ge=1_000, le=5_000_000)
     dry_run_only: bool = True
     demo_mode_allowed: bool = True
     max_diff_chars: int = Field(default=60_000, ge=10_000, le=200_000)
     max_document_bytes: int = Field(default=1_000_000, ge=1_000, le=5_000_000)
     github_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
-    prompt_version: str = "phase2-v1"
+    prompt_version: str = "phase3-v1"
 
     def resolve_path(self, value: Path) -> Path:
         return value if value.is_absolute() else PROJECT_ROOT / value
@@ -44,6 +57,19 @@ class Settings(BaseSettings):
     @property
     def resolved_frontend_dist_path(self) -> Path:
         return self.resolve_path(self.frontend_dist_path)
+
+    @property
+    def resolved_github_private_key(self) -> str | None:
+        if self.github_app_private_key:
+            return self.github_app_private_key.replace("\\n", "\n")
+        if self.github_app_private_key_path:
+            path = self.resolve_path(self.github_app_private_key_path)
+            return path.read_text(encoding="utf-8")
+        return None
+
+    @property
+    def github_app_ready(self) -> bool:
+        return bool(self.github_app_id and self.resolved_github_private_key)
 
 
 @lru_cache

@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
@@ -31,6 +32,29 @@ class ReviewStatus(StrEnum):
     running = "running"
     completed = "completed"
     failed = "failed"
+
+
+class TriggerSource(StrEnum):
+    manual = "manual"
+    webhook = "webhook"
+    demo = "demo"
+
+
+class JobStatus(StrEnum):
+    queued = "queued"
+    running = "running"
+    retrying = "retrying"
+    completed = "completed"
+    failed = "failed"
+    superseded = "superseded"
+
+
+class PublicationStatus(StrEnum):
+    not_published = "not_published"
+    publishing = "publishing"
+    published = "published"
+    failed = "failed"
+    stale = "stale"
 
 
 class AgentRole(StrEnum):
@@ -166,6 +190,11 @@ class ReviewRun(BaseModel):
     cached_from_id: str | None = None
     prompt_version: str | None = None
     demo_mode: bool = False
+    trigger_source: TriggerSource = TriggerSource.manual
+    job_id: str | None = None
+    publication_status: PublicationStatus = PublicationStatus.not_published
+    github_review_id: int | None = None
+    published_at: datetime | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -190,6 +219,68 @@ class KnowledgeDocumentList(BaseModel):
     total: int
 
 
+class ReviewJob(BaseModel):
+    id: str
+    idempotency_key: str
+    delivery_id: str
+    repository: str
+    pr_number: int
+    pr_url: str
+    head_sha: str
+    installation_id: int | None = None
+    status: JobStatus = JobStatus.queued
+    attempts: int = 0
+    max_attempts: int = 3
+    available_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    locked_at: datetime | None = None
+    error_message: str | None = None
+    review_id: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class ReviewJobList(BaseModel):
+    items: list[ReviewJob]
+    total: int
+
+
+class WebhookReceipt(BaseModel):
+    delivery_id: str
+    accepted: bool
+    duplicate: bool = False
+    job_id: str | None = None
+    message: str
+
+
+class PublicationComment(BaseModel):
+    path: str
+    line: int
+    side: Literal["RIGHT"] = "RIGHT"
+    body: str
+
+
+class PublicationPreview(BaseModel):
+    review_id: str
+    commit_sha: str | None
+    body: str
+    comments: list[PublicationComment]
+    can_publish: bool
+    blocking_reasons: list[str]
+    already_published: bool
+
+
+class PublishReviewRequest(BaseModel):
+    confirm: Literal[True]
+
+
+class PublicationResult(BaseModel):
+    review_id: str
+    status: PublicationStatus
+    github_review_id: int | None = None
+    published_at: datetime | None = None
+    message: str
+
+
 class KnowledgeChunk(BaseModel):
     id: str
     document_id: str
@@ -205,6 +296,11 @@ class HealthResponse(BaseModel):
     database: str
     openai_configured: bool
     github_configured: bool
+    github_app_configured: bool
+    webhook_configured: bool
+    worker_enabled: bool
+    pending_jobs: int
+    publishing_enabled: bool
     knowledge_documents: int
     dry_run_only: bool
     demo_mode_allowed: bool
@@ -217,6 +313,10 @@ class PublicConfig(BaseModel):
     embedding_model: str
     openai_configured: bool
     github_configured: bool
+    github_app_configured: bool
+    webhook_configured: bool
+    worker_enabled: bool
+    publishing_enabled: bool
     dry_run_only: bool
     demo_mode_allowed: bool
     prompt_version: str

@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
 from mergescope.domain.models import (
+    JobStatus,
     KnowledgeChunk,
     KnowledgeDocument,
     KnowledgeDocumentList,
+    PublicationStatus,
+    ReviewJob,
+    ReviewJobList,
     ReviewList,
     ReviewResult,
     ReviewRun,
     ReviewStatus,
+    TriggerSource,
 )
 
 BASE_SCHEMA = """
@@ -41,6 +46,11 @@ CREATE TABLE IF NOT EXISTS review_runs (
     cached_from_id TEXT,
     prompt_version TEXT,
     demo_mode INTEGER NOT NULL DEFAULT 0,
+    trigger_source TEXT NOT NULL DEFAULT 'manual',
+    job_id TEXT,
+    publication_status TEXT NOT NULL DEFAULT 'not_published',
+    github_review_id INTEGER,
+    published_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -63,6 +73,35 @@ CREATE TABLE IF NOT EXISTS document_chunks (
     embedding_json TEXT NOT NULL,
     UNIQUE(document_id, position)
 );
+CREATE TABLE IF NOT EXISTS review_jobs (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    delivery_id TEXT NOT NULL,
+    repository TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    pr_url TEXT NOT NULL,
+    head_sha TEXT NOT NULL,
+    installation_id INTEGER,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    available_at TEXT NOT NULL,
+    locked_at TEXT,
+    error_message TEXT,
+    review_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    delivery_id TEXT PRIMARY KEY,
+    event_name TEXT NOT NULL,
+    action TEXT,
+    repository TEXT,
+    pr_number INTEGER,
+    head_sha TEXT,
+    job_id TEXT,
+    received_at TEXT NOT NULL
+);
 """
 
 INDEX_SCHEMA = """
@@ -77,6 +116,10 @@ CREATE INDEX IF NOT EXISTS idx_review_runs_cache
     WHERE status = 'completed';
 CREATE INDEX IF NOT EXISTS idx_document_chunks_document_id
     ON document_chunks(document_id, position);
+CREATE INDEX IF NOT EXISTS idx_review_jobs_available
+    ON review_jobs(status, available_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_review_jobs_pull_request
+    ON review_jobs(repository, pr_number, head_sha);
 """
 
 REVIEW_COLUMN_MIGRATIONS = {
@@ -85,6 +128,11 @@ REVIEW_COLUMN_MIGRATIONS = {
     "cached_from_id": "TEXT",
     "prompt_version": "TEXT",
     "demo_mode": "INTEGER NOT NULL DEFAULT 0",
+    "trigger_source": "TEXT NOT NULL DEFAULT 'manual'",
+    "job_id": "TEXT",
+    "publication_status": "TEXT NOT NULL DEFAULT 'not_published'",
+    "github_review_id": "INTEGER",
+    "published_at": "TEXT",
 }
 
 
@@ -96,6 +144,7 @@ class ReviewRepository:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self.database_path) as connection:
             await connection.execute("PRAGMA foreign_keys=ON")
+            await connection.execute("PRAGMA busy_timeout=30000")
             await connection.executescript(BASE_SCHEMA)
             await self._migrate_review_columns(connection)
             await connection.executescript(INDEX_SCHEMA)
@@ -126,8 +175,10 @@ class ReviewRepository:
                     id, repository, pr_number, pr_url, head_sha, title, author, status,
                     dry_run, ticket_reference, result_json, issue_count, model,
                     input_tokens, output_tokens, latency_ms, error_message, cache_key,
-                    cache_hit, cached_from_id, prompt_version, demo_mode, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cache_hit, cached_from_id, prompt_version, demo_mode, trigger_source, job_id,
+                    publication_status, github_review_id, published_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, ?)
                 """,
                 self._values(run),
             )
@@ -145,6 +196,8 @@ class ReviewRepository:
                     result_json = ?, issue_count = ?, model = ?, input_tokens = ?,
                     output_tokens = ?, latency_ms = ?, error_message = ?, cache_key = ?,
                     cache_hit = ?, cached_from_id = ?, prompt_version = ?, demo_mode = ?,
+                    trigger_source = ?, job_id = ?, publication_status = ?, github_review_id = ?,
+                    published_at = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
@@ -170,6 +223,11 @@ class ReviewRepository:
                     run.cached_from_id,
                     run.prompt_version,
                     int(run.demo_mode),
+                    run.trigger_source.value,
+                    run.job_id,
+                    run.publication_status.value,
+                    run.github_review_id,
+                    run.published_at.isoformat() if run.published_at else None,
                     run.updated_at.isoformat(),
                     run.id,
                 ),
@@ -200,6 +258,34 @@ class ReviewRepository:
             row = await cursor.fetchone()
         return self._review_from_row(row) if row else None
 
+    async def begin_publication(self, review_id: str, lease_seconds: int = 300) -> ReviewRun | None:
+        now = datetime.now(UTC)
+        expired = now - timedelta(seconds=lease_seconds)
+        async with aiosqlite.connect(self.database_path) as connection:
+            connection.row_factory = aiosqlite.Row
+            await connection.execute("PRAGMA busy_timeout=30000")
+            await connection.execute("BEGIN IMMEDIATE")
+            cursor = await connection.execute(
+                """
+                UPDATE review_runs
+                SET publication_status = 'publishing', updated_at = ?
+                WHERE id = ? AND (
+                    publication_status IN ('not_published', 'failed')
+                    OR (publication_status = 'publishing' AND updated_at < ?)
+                )
+                """,
+                (now.isoformat(), review_id, expired.isoformat()),
+            )
+            if cursor.rowcount == 0:
+                await connection.rollback()
+                return None
+            row_cursor = await connection.execute(
+                "SELECT * FROM review_runs WHERE id = ?", (review_id,)
+            )
+            row = await row_cursor.fetchone()
+            await connection.commit()
+        return self._review_from_row(row) if row else None
+
     async def list(self, limit: int = 25, offset: int = 0) -> ReviewList:
         async with aiosqlite.connect(self.database_path) as connection:
             connection.row_factory = aiosqlite.Row
@@ -211,6 +297,205 @@ class ReviewRepository:
             count_cursor = await connection.execute("SELECT COUNT(*) FROM review_runs")
             total = (await count_cursor.fetchone())[0]
         return ReviewList(items=[self._review_from_row(row) for row in rows], total=total)
+
+    async def enqueue_webhook_job(
+        self,
+        job: ReviewJob,
+        event_name: str,
+        action: str | None,
+    ) -> tuple[ReviewJob, bool]:
+        async with aiosqlite.connect(self.database_path) as connection:
+            connection.row_factory = aiosqlite.Row
+            await connection.execute("PRAGMA busy_timeout=30000")
+            await connection.execute("BEGIN IMMEDIATE")
+            delivery_cursor = await connection.execute(
+                "SELECT job_id FROM webhook_deliveries WHERE delivery_id = ?",
+                (job.delivery_id,),
+            )
+            delivery = await delivery_cursor.fetchone()
+            if delivery:
+                existing = await self._job_by_id(connection, delivery["job_id"])
+                await connection.rollback()
+                return existing or job, True
+
+            key_cursor = await connection.execute(
+                "SELECT * FROM review_jobs WHERE idempotency_key = ?",
+                (job.idempotency_key,),
+            )
+            existing_row = await key_cursor.fetchone()
+            duplicate = existing_row is not None
+            if existing_row:
+                stored_job = self._job_from_row(existing_row)
+            else:
+                await connection.execute(
+                    """
+                    INSERT INTO review_jobs (
+                        id, idempotency_key, delivery_id, repository, pr_number, pr_url, head_sha,
+                        installation_id, status, attempts, max_attempts, available_at, locked_at,
+                        error_message, review_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    self._job_values(job),
+                )
+                stored_job = job
+            await connection.execute(
+                """
+                INSERT INTO webhook_deliveries (
+                    delivery_id, event_name, action, repository, pr_number, head_sha, job_id,
+                    received_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job.delivery_id,
+                    event_name,
+                    action,
+                    job.repository,
+                    job.pr_number,
+                    job.head_sha,
+                    stored_job.id,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            await connection.commit()
+        return stored_job, duplicate
+
+    async def claim_next_job(self, lease_seconds: int) -> ReviewJob | None:
+        now = datetime.now(UTC)
+        expired = now - timedelta(seconds=lease_seconds)
+        async with aiosqlite.connect(self.database_path) as connection:
+            connection.row_factory = aiosqlite.Row
+            await connection.execute("PRAGMA busy_timeout=30000")
+            await connection.execute("BEGIN IMMEDIATE")
+            await connection.execute(
+                """
+                UPDATE review_jobs
+                SET status = 'retrying', locked_at = NULL, available_at = ?,
+                    error_message = 'Worker lease expired; retrying.', updated_at = ?
+                WHERE status = 'running' AND locked_at < ? AND attempts < max_attempts
+                """,
+                (now.isoformat(), now.isoformat(), expired.isoformat()),
+            )
+            await connection.execute(
+                """
+                UPDATE review_jobs
+                SET status = 'failed', locked_at = NULL,
+                    error_message = 'Worker lease expired after maximum attempts.', updated_at = ?
+                WHERE status = 'running' AND locked_at < ? AND attempts >= max_attempts
+                """,
+                (now.isoformat(), expired.isoformat()),
+            )
+            cursor = await connection.execute(
+                """
+                SELECT * FROM review_jobs
+                WHERE status IN ('queued', 'retrying') AND available_at <= ?
+                    AND attempts < max_attempts
+                ORDER BY available_at, created_at
+                LIMIT 1
+                """,
+                (now.isoformat(),),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                await connection.commit()
+                return None
+            await connection.execute(
+                """
+                UPDATE review_jobs
+                SET status = 'running', attempts = attempts + 1, locked_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (now.isoformat(), now.isoformat(), row["id"]),
+            )
+            updated = await self._job_by_id(connection, row["id"])
+            await connection.commit()
+        return updated
+
+    async def complete_job(self, job_id: str, review_id: str) -> None:
+        await self._update_job(
+            job_id,
+            status=JobStatus.completed,
+            review_id=review_id,
+            error_message=None,
+        )
+
+    async def supersede_job(self, job_id: str, message: str) -> None:
+        await self._update_job(
+            job_id,
+            status=JobStatus.superseded,
+            review_id=None,
+            error_message=message,
+        )
+
+    async def fail_job(self, job: ReviewJob, message: str, *, retryable: bool = True) -> JobStatus:
+        retrying = retryable and job.attempts < job.max_attempts
+        status = JobStatus.retrying if retrying else JobStatus.failed
+        delay_seconds = min(60, 2 ** max(job.attempts - 1, 0)) if retrying else 0
+        await self._update_job(
+            job.id,
+            status=status,
+            review_id=None,
+            error_message=message[:2_000],
+            available_at=datetime.now(UTC) + timedelta(seconds=delay_seconds),
+        )
+        return status
+
+    async def list_jobs(self, limit: int = 25) -> ReviewJobList:
+        async with aiosqlite.connect(self.database_path) as connection:
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                "SELECT * FROM review_jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+            )
+            rows = await cursor.fetchall()
+            count_cursor = await connection.execute("SELECT COUNT(*) FROM review_jobs")
+            total = (await count_cursor.fetchone())[0]
+        return ReviewJobList(items=[self._job_from_row(row) for row in rows], total=total)
+
+    async def pending_job_count(self) -> int:
+        async with aiosqlite.connect(self.database_path) as connection:
+            cursor = await connection.execute(
+                """
+                SELECT COUNT(*) FROM review_jobs
+                WHERE status IN ('queued', 'retrying', 'running')
+                """
+            )
+            return (await cursor.fetchone())[0]
+
+    async def _update_job(
+        self,
+        job_id: str,
+        *,
+        status: JobStatus,
+        review_id: str | None,
+        error_message: str | None,
+        available_at: datetime | None = None,
+    ) -> None:
+        now = datetime.now(UTC)
+        async with aiosqlite.connect(self.database_path) as connection:
+            await connection.execute(
+                """
+                UPDATE review_jobs
+                SET status = ?, review_id = ?, error_message = ?, available_at = ?,
+                    locked_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status.value,
+                    review_id,
+                    error_message,
+                    (available_at or now).isoformat(),
+                    now.isoformat(),
+                    job_id,
+                ),
+            )
+            await connection.commit()
+
+    @staticmethod
+    async def _job_by_id(connection: aiosqlite.Connection, job_id: str | None) -> ReviewJob | None:
+        if not job_id:
+            return None
+        cursor = await connection.execute("SELECT * FROM review_jobs WHERE id = ?", (job_id,))
+        row = await cursor.fetchone()
+        return ReviewRepository._job_from_row(row) if row else None
 
     async def create_document(
         self,
@@ -342,6 +627,11 @@ class ReviewRepository:
             run.cached_from_id,
             run.prompt_version,
             int(run.demo_mode),
+            run.trigger_source.value,
+            run.job_id,
+            run.publication_status.value,
+            run.github_review_id,
+            run.published_at.isoformat() if run.published_at else None,
             run.created_at.isoformat(),
             run.updated_at.isoformat(),
         )
@@ -373,6 +663,23 @@ class ReviewRepository:
             cached_from_id=row["cached_from_id"] if "cached_from_id" in keys else None,
             prompt_version=row["prompt_version"] if "prompt_version" in keys else None,
             demo_mode=bool(row["demo_mode"]) if "demo_mode" in keys else False,
+            trigger_source=(
+                TriggerSource(row["trigger_source"])
+                if "trigger_source" in keys
+                else TriggerSource.manual
+            ),
+            job_id=row["job_id"] if "job_id" in keys else None,
+            publication_status=(
+                PublicationStatus(row["publication_status"])
+                if "publication_status" in keys
+                else PublicationStatus.not_published
+            ),
+            github_review_id=(row["github_review_id"] if "github_review_id" in keys else None),
+            published_at=(
+                datetime.fromisoformat(row["published_at"])
+                if "published_at" in keys and row["published_at"]
+                else None
+            ),
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
         )
@@ -401,4 +708,48 @@ class ReviewRepository:
             chunk_count=row["chunk_count"],
             embedding_model=row["embedding_model"],
             created_at=datetime.fromisoformat(row["created_at"]),
+        )
+
+    @staticmethod
+    def _job_values(job: ReviewJob) -> tuple[object, ...]:
+        return (
+            job.id,
+            job.idempotency_key,
+            job.delivery_id,
+            job.repository,
+            job.pr_number,
+            job.pr_url,
+            job.head_sha,
+            job.installation_id,
+            job.status.value,
+            job.attempts,
+            job.max_attempts,
+            job.available_at.isoformat(),
+            job.locked_at.isoformat() if job.locked_at else None,
+            job.error_message,
+            job.review_id,
+            job.created_at.isoformat(),
+            job.updated_at.isoformat(),
+        )
+
+    @staticmethod
+    def _job_from_row(row: aiosqlite.Row) -> ReviewJob:
+        return ReviewJob(
+            id=row["id"],
+            idempotency_key=row["idempotency_key"],
+            delivery_id=row["delivery_id"],
+            repository=row["repository"],
+            pr_number=row["pr_number"],
+            pr_url=row["pr_url"],
+            head_sha=row["head_sha"],
+            installation_id=row["installation_id"],
+            status=JobStatus(row["status"]),
+            attempts=row["attempts"],
+            max_attempts=row["max_attempts"],
+            available_at=datetime.fromisoformat(row["available_at"]),
+            locked_at=datetime.fromisoformat(row["locked_at"]) if row["locked_at"] else None,
+            error_message=row["error_message"],
+            review_id=row["review_id"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
         )

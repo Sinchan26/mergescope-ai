@@ -18,6 +18,7 @@ import {
   SearchCode,
   ShieldCheck,
   Sparkles,
+  Webhook,
   X,
   XCircle,
 } from "lucide-react";
@@ -25,9 +26,17 @@ import { api } from "./api";
 import { KnowledgeBase } from "./components/KnowledgeBase";
 import { ReviewInspector } from "./components/ReviewInspector";
 import { StatusBadge, humanize } from "./components/StatusBadge";
-import type { Health, KnowledgeDocument, PublicConfig, ReviewRun } from "./types";
+import { WorkflowCenter } from "./components/WorkflowCenter";
+import type {
+  Health,
+  KnowledgeDocument,
+  PublicationResult,
+  PublicConfig,
+  ReviewJob,
+  ReviewRun,
+} from "./types";
 
-type View = "overview" | "knowledge";
+type View = "overview" | "knowledge" | "automation";
 
 const formatDate = (value: string) =>
   new Intl.DateTimeFormat(undefined, {
@@ -43,6 +52,7 @@ function App() {
   const [config, setConfig] = useState<PublicConfig | null>(null);
   const [reviews, setReviews] = useState<ReviewRun[]>([]);
   const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
+  const [jobs, setJobs] = useState<ReviewJob[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [prUrl, setPrUrl] = useState("");
   const [ticketReference, setTicketReference] = useState("");
@@ -65,13 +75,14 @@ function App() {
   const loadDashboard = async () => {
     setLoading(true);
     try {
-      const [nextHealth, nextConfig, nextReviews, nextDocuments] = await Promise.all([
-        api.health(), api.config(), api.reviews(), api.documents(),
+      const [nextHealth, nextConfig, nextReviews, nextDocuments, nextJobs] = await Promise.all([
+        api.health(), api.config(), api.reviews(), api.documents(), api.jobs(),
       ]);
       setHealth(nextHealth);
       setConfig(nextConfig);
       setReviews(nextReviews.items);
       setDocuments(nextDocuments.items);
+      setJobs(nextJobs.items);
       setSelectedId((current) => current ?? nextReviews.items[0]?.id ?? null);
       setError(null);
     } catch (loadError) {
@@ -82,6 +93,17 @@ function App() {
   };
 
   useEffect(() => { void loadDashboard(); }, []);
+
+  useEffect(() => {
+    if (view !== "automation") return;
+    const interval = window.setInterval(() => {
+      void Promise.all([api.health(), api.jobs()]).then(([nextHealth, nextJobs]) => {
+        setHealth(nextHealth);
+        setJobs(nextJobs.items);
+      }).catch(() => undefined);
+    }, 5_000);
+    return () => window.clearInterval(interval);
+  }, [view]);
 
   const executeReview = async (demoMode: boolean) => {
     setSubmitting(true);
@@ -143,8 +165,25 @@ function App() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
+  const openJobReview = (reviewId: string) => {
+    setSelectedId(reviewId);
+    navigate("overview");
+    requestAnimationFrame(() => document.getElementById("history")?.scrollIntoView());
+  };
+
+  const publicationCompleted = (result: PublicationResult) => {
+    setReviews((current) => current.map((review) => review.id === result.review_id ? {
+      ...review,
+      publication_status: result.status,
+      github_review_id: result.github_review_id,
+      published_at: result.published_at,
+    } : review));
+    setNotice(result.message);
+  };
+
   return (
     <div className="app-shell">
+      <a className="skip-link" href="#main-content">Skip to main content</a>
       <aside className={`sidebar ${mobileNavOpen ? "sidebar-open" : ""}`}>
         <div className="brand">
           <div className="brand-mark" aria-hidden="true"><SearchCode size={22} /></div>
@@ -155,11 +194,12 @@ function App() {
           <button className={`nav-item ${view === "overview" ? "active" : ""}`} onClick={() => navigate("overview")}><LayoutDashboard size={18} />Overview</button>
           <button className="nav-item" onClick={() => { navigate("overview"); requestAnimationFrame(() => document.getElementById("new-review")?.scrollIntoView()); }}><GitPullRequest size={18} />New review</button>
           <button className={`nav-item ${view === "knowledge" ? "active" : ""}`} onClick={() => navigate("knowledge")}><BookOpen size={18} />Knowledge base<span className="nav-count">{documents.length}</span></button>
+          <button className={`nav-item ${view === "automation" ? "active" : ""}`} onClick={() => navigate("automation")}><Webhook size={18} />Workflow center<span className="nav-count">{health?.pending_jobs ?? 0}</span></button>
           <button className="nav-item" onClick={() => { navigate("overview"); requestAnimationFrame(() => document.getElementById("history")?.scrollIntoView()); }}><History size={18} />Review history</button>
         </nav>
         <div className="sidebar-section">
-          <p>Phase 2</p>
-          <div className="phase-progress"><span aria-hidden="true" /><small>2 of 4 · Grounded review</small></div>
+          <p>Phase 3</p>
+          <div className="phase-progress"><span aria-hidden="true" /><small>3 of 4 · GitHub workflow</small></div>
         </div>
         <div className="sidebar-status">
           <div className="status-line"><span className={`health-dot ${health?.status === "ready" ? "online" : ""}`} /><span>{health?.status === "ready" ? "API operational" : "API unavailable"}</span></div>
@@ -168,10 +208,10 @@ function App() {
       </aside>
       {mobileNavOpen && <button className="nav-backdrop" aria-label="Close navigation" onClick={() => setMobileNavOpen(false)} />}
 
-      <main className="main-content">
+      <main className="main-content" id="main-content" tabIndex={-1}>
         <header className="topbar">
           <button className="icon-button menu-button" aria-label="Open navigation" onClick={() => setMobileNavOpen(true)}><Menu size={20} /></button>
-          <div><p className="eyebrow">{view === "overview" ? "Review workspace" : "Grounding workspace"}</p><h1>{view === "overview" ? "Pull request overview" : "Knowledge management"}</h1></div>
+          <div><p className="eyebrow">{view === "overview" ? "Review workspace" : view === "knowledge" ? "Grounding workspace" : "Automation workspace"}</p><h1>{view === "overview" ? "Pull request overview" : view === "knowledge" ? "Knowledge management" : "GitHub workflow operations"}</h1></div>
           <div className="topbar-actions">
             <div className="model-chip"><Bot size={16} /><span>{config?.openai_model ?? "Loading model"}</span></div>
             <button className="icon-button" onClick={() => void loadDashboard()} aria-label="Refresh dashboard"><RefreshCw size={18} className={loading ? "spin" : ""} /></button>
@@ -183,6 +223,8 @@ function App() {
 
         {view === "knowledge" ? (
           <KnowledgeBase documents={documents} config={config} uploading={uploading} onUpload={uploadDocument} onDelete={deleteDocument} />
+        ) : view === "automation" ? (
+          <WorkflowCenter config={config} health={health} jobs={jobs} loading={loading} onRefresh={() => void loadDashboard()} onOpenReview={openJobReview} />
         ) : (
           <>
             {!config?.openai_configured && !loading && (
@@ -227,7 +269,7 @@ function App() {
                     {reviews.map((review) => <tr key={review.id} className={selected?.id === review.id ? "selected-row" : ""}>
                       <td><button className="review-title" onClick={() => setSelectedId(review.id)}><strong>{review.title ?? "Review did not start"}</strong><span>{review.repository ?? "Unknown repository"} {review.pr_number ? `#${review.pr_number}` : ""}</span></button></td>
                       <td><StatusBadge status={review.status} /></td>
-                      <td>{review.demo_mode ? <span className="demo-state">Demo</span> : review.cache_hit ? <span className="cache-state"><DatabaseZap size={12} /> Cache</span> : <span className="fresh-state">Fresh</span>}</td>
+                      <td>{review.demo_mode ? <span className="demo-state">Demo</span> : review.trigger_source === "webhook" ? <span className="webhook-state"><Webhook size={12} /> Webhook</span> : review.cache_hit ? <span className="cache-state"><DatabaseZap size={12} /> Cache</span> : <span className="fresh-state">Manual</span>}</td>
                       <td><span className={`verdict verdict-${review.result?.approval ?? "pending"}`}>{review.result ? humanize(review.result.approval) : "—"}</span></td>
                       <td><span className="issue-count">{review.issue_count}</span></td>
                       <td><time dateTime={review.created_at}>{formatDate(review.created_at)}</time></td>
@@ -236,7 +278,7 @@ function App() {
                   </tbody></table></div>
                 )}
               </article>
-              <ReviewInspector selected={selected} />
+              <ReviewInspector selected={selected} onPublished={publicationCompleted} />
             </section>
           </>
         )}

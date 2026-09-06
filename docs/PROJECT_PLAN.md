@@ -2,117 +2,107 @@
 
 ## Product boundary
 
-MergeScope AI is a local, Docker-free review workspace. A developer submits a GitHub pull-request
-URL, MergeScope obtains the changed files and repository guidance, retrieves relevant local
-knowledge, runs specialized OpenAI reviewers, validates their findings against exact added lines,
-and stores the run in SQLite.
+MergeScope AI is a local, Docker-free review workspace. It supports manual reviews and signed
+GitHub App events without requiring Jira, Redis, Docker, or an external job service.
 
-Jira remains optional metadata. It is not contacted and is not a runtime dependency.
-
-## Phase 2 request flow
+## Phase 3 workflow
 
 ```mermaid
 flowchart TD
-    UI[React dashboard] --> API[FastAPI review service]
-    API --> GH[GitHub PR and guidance]
-    API --> KB[SQLite knowledge retrieval]
-    GH --> GRAPH[LangGraph reviewers]
-    KB --> GRAPH
-    GRAPH --> VALIDATOR[Deterministic line validator]
-    VALIDATOR --> DB[SQLite review history]
-    DB --> UI
+    GH[GitHub pull request event] --> VERIFY[HMAC verification]
+    VERIFY --> QUEUE[SQLite durable job]
+    QUEUE --> WORKER[Leased review worker]
+    WORKER --> REVIEW[Grounded agent review]
+    REVIEW --> PREVIEW[Comment preview]
+    PREVIEW -->|Explicit confirmation| PUBLISH[GitHub COMMENT review]
 ```
 
-The review graph always runs the code and testing reviewers. It conditionally adds the security
-reviewer when paths or patches touch sensitive concepts, then asks a synthesizer for the narrative.
-The final validator rejects ungrounded findings and independently calculates the approval verdict.
+Webhook HTTP requests finish after durable enqueue. The worker independently claims jobs, checks
+the expected head SHA, runs the Phase 2 review graph, and records the resulting review ID. Publishing
+is never automatic: it has its own server feature flag, preview endpoint, user confirmation, current
+head check, and recovery marker.
 
 ## Component map
 
 | Area | Responsibility | Implementation |
 |---|---|---|
-| Dashboard | Start reviews, manage knowledge, inspect agents/evidence/history | React + Vite + TypeScript |
-| API | Validate and expose review and knowledge resources | FastAPI |
-| Review graph | Route specialists and aggregate usage | LangGraph `StateGraph` |
-| Review specialists | Inspect code, security, and testing risks | OpenAI Responses structured outputs |
-| Validator | Enforce changed paths/lines, deduplicate, calculate verdict | Deterministic Python |
-| GitHub adapter | Retrieve PR metadata, patches, and repository guidance | `httpx`, token optional |
-| Knowledge retrieval | Chunk, embed, rank, and cite local guidance | OpenAI embeddings + cosine similarity |
-| Persistence | Store review runs, cache metadata, documents, and vectors | SQLite via `aiosqlite` |
-| Ticket context | Preserve an optional reference without Jira | Local string metadata |
+| Dashboard | Reviews, knowledge, workflow readiness, jobs, previews | React + TypeScript |
+| API | Manual reviews, webhooks, queue state, and publication | FastAPI |
+| Review graph | Conditional specialists and deterministic validation | LangGraph + OpenAI |
+| GitHub App auth | JWT and installation-token lifecycle | PyJWT + `httpx` |
+| Webhook boundary | Raw-body HMAC verification and event filtering | Python `hmac` |
+| Durable queue | Deduplication, leases, retries, and recovery | SQLite transactions |
+| Worker | Claim jobs and enforce expected PR heads | Async background task |
+| Publisher | Preview, confirm, revalidate head, create review | GitHub Reviews REST API |
+| Knowledge retrieval | Embed and rank repository-specific guidance | OpenAI embeddings + SQLite |
 
 ## Weekend delivery plan
 
 ### Weekend 1 — foundation and manual dry run
 
 - [x] Docker-free FastAPI and React workspace
-- [x] Environment configuration without committed secrets
-- [x] Public/private GitHub PR retrieval
-- [x] Typed OpenAI review result
-- [x] SQLite history and review detail
-- [x] Responsive dashboard and setup guidance
-- [x] Mocked tests, lint, dependency audit, and production build
+- [x] Manual GitHub PR retrieval and typed OpenAI review
+- [x] SQLite history, detail, and responsive dashboard
+- [x] Mocked tests, lint, audit, and production build
 
-Exit condition met: a developer with an OpenAI key can review a public PR locally without Jira or
-Docker.
+Exit condition met: a public PR can be reviewed locally without Jira or Docker.
 
 ### Weekend 2 — stronger review grounding
 
-- [x] Build an exact added-line map from unified patches
-- [x] Load `AGENTS.md`, contribution guidance, and the PR template
-- [x] Add local document ingestion and OpenAI embedding retrieval
-- [x] Add prompt-version and head-SHA cache keys with force-refresh support
-- [x] Add code, conditional security, testing, and synthesis graph nodes
-- [x] Reject invalid paths, invalid/missing lines, and duplicate findings
-- [x] Show agents, context sources, cache state, and diff excerpts in the UI
-- [x] Add a deterministic demo requiring no external API calls
+- [x] Exact added-line parsing and post-model validation
+- [x] Repository and embedded document guidance
+- [x] Code, conditional security, testing, and synthesis nodes
+- [x] Head-SHA/prompt cache and deterministic demo
+- [x] Agent, context, cache, and diff evidence UI
 
-Exit condition met: every accepted finding is traceable to a valid added line and its supplied
-review context is visible in the dashboard.
+Exit condition met: every accepted finding is traceable to a valid added line.
 
 ### Weekend 3 — GitHub workflow integration
 
-- [ ] Add GitHub App authentication and webhook signature verification
-- [ ] Move external review jobs to a persistent worker model
-- [ ] Add idempotency for webhook retries and PR head changes
-- [ ] Preview comments before publishing
-- [ ] Add an explicit, opt-in GitHub publishing mode
+- [x] GitHub App RS256 authentication and installation tokens
+- [x] HMAC-SHA256 webhook signature verification
+- [x] Persistent SQLite job queue with leases and retry backoff
+- [x] Delivery and PR-head idempotency
+- [x] Stale-head supersession before review and publication
+- [x] Comment payload preview and accessible confirmation dialog
+- [x] Explicit, disabled-by-default GitHub publishing mode
+- [x] Publish recovery marker to prevent duplicate GitHub reviews
 
-Exit condition: a PR event can safely schedule one durable review and publish only validated
-comments.
+Exit condition met: a PR event can schedule one durable review, and only validated comments can be
+published after explicit confirmation.
 
 ### Weekend 4 — evaluation and operational readiness
 
 - [ ] Create a labeled evaluation set with good, bad, and adversarial diffs
 - [ ] Measure precision, invalid-line rate, latency, and estimated model cost
-- [ ] Add retry/backoff policies and request correlation IDs
+- [ ] Add request correlation IDs and structured logs
 - [ ] Add repository allowlists and configurable review policies
-- [ ] Package a non-Docker deployment guide and backup procedure
+- [ ] Package a non-Docker deployment and SQLite backup procedure
 
 Exit condition: review quality and failure behavior are measurable before broader use.
 
 ## Important engineering decisions
 
-1. **SQLite is the source of truth.** It keeps the setup small and now stores both reviews and
-   knowledge vectors.
-2. **Dry run is enforced by the server.** No GitHub write adapter exists, so the UI cannot publish
-   accidentally.
-3. **All retrieved content is untrusted.** Model instructions separate data from system behavior.
-4. **Structured output is mandatory.** Each model response is parsed against a Pydantic schema.
-5. **The validator owns trust.** Model findings are accepted only when their file and line match an
-   actual added line; the model's proposed approval cannot override the deterministic verdict.
-6. **Security review is conditional.** Obvious low-risk changes avoid one model call, while paths or
-   patches involving authentication, secrets, sessions, queries, and related boundaries include it.
-7. **Cache identity is explicit.** Repository, PR number, head SHA, and prompt version prevent stale
-   reuse; the UI can force a fresh run.
-8. **External clients are replaceable.** Tests use fake GitHub, OpenAI, and embedding adapters.
+1. **Webhook work is asynchronous.** GitHub receives a fast response after the job is committed.
+2. **SQLite remains the source of truth.** `BEGIN IMMEDIATE` serializes claims and deduplication;
+   worker leases recover interrupted jobs.
+3. **A head SHA is a workflow identity.** A changed PR creates a new job and makes older work stale.
+4. **Reviewing and publishing are separate capabilities.** Review generation stays read-only, while
+   the only write endpoint requires configuration, an operator token, and literal confirmation.
+5. **The validator owns comments.** Only accepted added-line findings enter the preview payload.
+6. **GitHub review event is `COMMENT`.** MergeScope does not approve or request changes on behalf of
+   a user.
+7. **Publication is recoverable.** A deterministic marker lets a retry detect an already-created
+   GitHub review after a timeout.
+8. **Private keys stay outside version control.** The preferred setup references a local PEM path.
 
-## Test strategy without Jira
+## Phase 3 test path
 
-1. Run the automated suite; it covers diff parsing, reviewer routing, deterministic validation,
-   caching, document retrieval, API resources, and SQLite persistence.
-2. Start the app without credentials and run the deterministic demo.
-3. Confirm agents, valid line excerpts, and context sources appear in the inspector.
-4. Add an OpenAI key, index a small guidance document, and run a public PR review.
-5. Repeat the same PR to confirm a cache hit, then enable force re-review to bypass it.
-6. Leave Ticket reference empty or use `LOCAL-101`; confirm no Jira request occurs.
+1. Run the deterministic demo and confirm publication is blocked.
+2. Configure the GitHub App with publishing disabled.
+3. Deliver a signed `ping`, then open or update a PR.
+4. Open **Workflow center** and verify the job becomes completed with one result.
+5. Redeliver the same event and confirm no second job is created.
+6. Inspect the comment preview for exact paths and added lines.
+7. Enable publishing only in a test repository, restart the server, and explicitly confirm once.
+8. Push another commit and confirm the previous review can no longer publish.

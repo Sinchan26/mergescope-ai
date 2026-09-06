@@ -12,7 +12,7 @@ from mergescope.domain.models import (
     ReviewResult,
     ReviewStatus,
 )
-from mergescope.services.reviews import ReviewService
+from mergescope.services.reviews import ReviewService, StalePullRequestError
 
 
 class FakeGitHub:
@@ -156,3 +156,18 @@ async def test_openai_key_is_required_before_a_live_run_is_created(tmp_path: Pat
         )
 
     assert (await repository.list()).total == 0
+
+
+async def test_expected_webhook_head_rejects_superseded_pull_request(tmp_path: Path) -> None:
+    service, repository = build_service(tmp_path, FakeOrchestrator())
+    await repository.initialize()
+
+    with pytest.raises(StalePullRequestError, match="superseded"):
+        await service.run_manual_review(
+            ManualReviewRequest(pr_url="https://github.com/example/project/pull/7"),
+            expected_head_sha="older-head",
+        )
+
+    runs = await repository.list()
+    assert runs.total == 1
+    assert runs.items[0].status is ReviewStatus.failed

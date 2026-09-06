@@ -3,6 +3,9 @@ import type {
   KnowledgeDocument,
   KnowledgeDocumentList,
   PublicConfig,
+  PublicationPreview,
+  PublicationResult,
+  ReviewJobList,
   ReviewList,
   ReviewRun,
 } from "./types";
@@ -30,6 +33,7 @@ export const api = {
   health: () => request<Health>("/api/health"),
   config: () => request<PublicConfig>("/api/config"),
   reviews: () => request<ReviewList>("/api/reviews?limit=50"),
+  jobs: () => request<ReviewJobList>("/api/jobs?limit=50"),
   documents: () => request<KnowledgeDocumentList>("/api/knowledge/documents"),
   createReview: ({
     prUrl,
@@ -59,4 +63,12 @@ export const api = {
   },
   deleteDocument: (documentId: string) =>
     request<void>(`/api/knowledge/documents/${documentId}`, { method: "DELETE" }),
+  publicationPreview: (reviewId: string) =>
+    request<PublicationPreview>(`/api/reviews/${reviewId}/publication-preview`),
+  publishReview: (reviewId: string, confirmationToken: string) =>
+    request<PublicationResult>(`/api/reviews/${reviewId}/publish`, {
+      method: "POST",
+      headers: { "X-MergeScope-Publish-Token": confirmationToken },
+      body: JSON.stringify({ confirm: true }),
+    }),
 };

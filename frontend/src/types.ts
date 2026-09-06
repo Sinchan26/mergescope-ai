@@ -1,4 +1,18 @@
 export type ReviewStatus = "queued" | "running" | "completed" | "failed";
+export type TriggerSource = "manual" | "webhook" | "demo";
+export type JobStatus =
+  | "queued"
+  | "running"
+  | "retrying"
+  | "completed"
+  | "failed"
+  | "superseded";
+export type PublicationStatus =
+  | "not_published"
+  | "publishing"
+  | "published"
+  | "failed"
+  | "stale";
 export type Approval = "approve" | "comment" | "request_changes";
 export type Severity = "critical" | "high" | "medium" | "low";
 export type AgentRole =
@@ -12,6 +26,11 @@ export interface Health {
   database: string;
   openai_configured: boolean;
   github_configured: boolean;
+  github_app_configured: boolean;
+  webhook_configured: boolean;
+  worker_enabled: boolean;
+  pending_jobs: number;
+  publishing_enabled: boolean;
   knowledge_documents: number;
   dry_run_only: boolean;
   demo_mode_allowed: boolean;
@@ -24,6 +43,10 @@ export interface PublicConfig {
   embedding_model: string;
   openai_configured: boolean;
   github_configured: boolean;
+  github_app_configured: boolean;
+  webhook_configured: boolean;
+  worker_enabled: boolean;
+  publishing_enabled: boolean;
   dry_run_only: boolean;
   demo_mode_allowed: boolean;
   prompt_version: string;
@@ -87,6 +110,11 @@ export interface ReviewRun {
   cached_from_id: string | null;
   prompt_version: string | null;
   demo_mode: boolean;
+  trigger_source: TriggerSource;
+  job_id: string | null;
+  publication_status: PublicationStatus;
+  github_review_id: number | null;
+  published_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -109,4 +137,54 @@ export interface KnowledgeDocument {
 export interface KnowledgeDocumentList {
   items: KnowledgeDocument[];
   total: number;
+}
+
+export interface ReviewJob {
+  id: string;
+  idempotency_key: string;
+  delivery_id: string;
+  repository: string;
+  pr_number: number;
+  pr_url: string;
+  head_sha: string;
+  installation_id: number | null;
+  status: JobStatus;
+  attempts: number;
+  max_attempts: number;
+  available_at: string;
+  locked_at: string | null;
+  error_message: string | null;
+  review_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ReviewJobList {
+  items: ReviewJob[];
+  total: number;
+}
+
+export interface PublicationComment {
+  path: string;
+  line: number;
+  side: "RIGHT";
+  body: string;
+}
+
+export interface PublicationPreview {
+  review_id: string;
+  commit_sha: string | null;
+  body: string;
+  comments: PublicationComment[];
+  can_publish: boolean;
+  blocking_reasons: string[];
+  already_published: boolean;
+}
+
+export interface PublicationResult {
+  review_id: string;
+  status: PublicationStatus;
+  github_review_id: number | null;
+  published_at: string | null;
+  message: string;
 }
