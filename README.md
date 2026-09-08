@@ -4,8 +4,10 @@ MergeScope AI is a Docker-free pull-request review workspace. It retrieves GitHu
 guidance, runs specialized OpenAI reviewers through LangGraph, validates every finding against the
 exact added lines, and stores durable review workflows in SQLite.
 
-Phase 3 adds signed GitHub App automation. Webhooks only enqueue persistent work; publishing remains
-locked until it is enabled on the server and explicitly confirmed from a comment preview.
+Phase 4 adds measurable quality and operational boundaries. A versioned labeled suite tracks
+precision, recall, invalid-line rate, latency, token use, and configured cost estimates. Repository
+allowlists, per-repository policies, structured logs, and verified SQLite backups prepare the local
+service for controlled use.
 
 ## Capabilities
 
@@ -18,6 +20,10 @@ locked until it is enabled on the server and explicitly confirmed from a comment
 - HMAC-SHA256 webhook verification before payload parsing
 - Delivery-ID and PR-head idempotency, retry backoff, worker leases, and stale-head supersession
 - Comment preview with a second head-SHA check and explicit publish confirmation
+- Six labeled good, bad, and adversarial evaluation cases with persisted case-level metrics
+- Repository allowlists and policy-controlled agent routing, confidence, blocking, and publishing
+- Correlation IDs across HTTP requests and durable webhook jobs with structured JSON logs
+- Online SQLite backup CLI with integrity checking, SHA-256 manifests, and retention
 - Deterministic demo mode requiring no GitHub, Jira, or OpenAI credentials
 - No Docker, Redis, external queue, vector database, or Jira dependency
 
@@ -56,6 +62,10 @@ npm run dev
 
 Open [http://localhost:5173](http://localhost:5173). Vite proxies `/api` to FastAPI. The application
 starts its SQLite-backed worker in the FastAPI process, so no additional server is required.
+
+For Phase 4 controls, copy `config/review-policies.example.json` to
+`config/review-policies.json`, set `ALLOWED_REPOSITORIES`, and configure a separate
+`EVALUATION_RUN_TOKEN`. See [Operations and deployment](docs/OPERATIONS.md).
 
 ## Test without Jira or API keys
 
@@ -100,6 +110,9 @@ FastAPI serves `frontend/dist` at [http://localhost:8000](http://localhost:8000)
 | `POST` | `/api/reviews/{id}/publish` | Publish after literal `confirm: true` validation |
 | `GET` | `/api/jobs` | Inspect durable webhook review jobs |
 | `POST` | `/api/webhooks/github` | Receive signed GitHub App deliveries |
+| `GET` | `/api/policies` | Inspect non-secret policy readiness and defaults |
+| `GET` | `/api/evaluations/dataset` | Inspect the labeled evaluation-set summary |
+| `GET/POST` | `/api/evaluations/runs` | List or explicitly run measured evaluations |
 | `GET/POST` | `/api/knowledge/documents` | List or index local guidance |
 | `DELETE` | `/api/knowledge/documents/{id}` | Delete a document and its chunks |
 
@@ -114,6 +127,17 @@ Interactive API documentation is available at `/docs`.
 - Only deterministic, line-validated findings become inline comments.
 - GitHub publishing defaults to disabled and requires an explicit preview confirmation.
 - The write endpoint additionally requires a server-side operator token entered at confirmation.
+- Paid evaluation runs require a separate server-side evaluation token and literal confirmation.
+- An optional repository allowlist is enforced before manual review or webhook enqueue.
+- The resolved review policy is part of cache and webhook-job identity.
+- Repository policy defaults keep comment publishing disabled until explicitly enabled per repo.
+- Logs never include request bodies, credentials, webhook payloads, or operator tokens.
 - Publication uses a hidden idempotency marker to recover from ambiguous network failures.
 - Published reviews use GitHub's non-approving `COMMENT` event.
 - Secrets and private keys are never returned by the API; `.env` and `*.pem` are ignored by Git.
+
+## Operational guides
+
+- [GitHub App setup](docs/GITHUB_APP_SETUP.md)
+- [Evaluation, policies, deployment, and backup](docs/OPERATIONS.md)
+- [Four-weekend implementation plan](docs/PROJECT_PLAN.md)

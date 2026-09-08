@@ -57,6 +57,24 @@ class PublicationStatus(StrEnum):
     stale = "stale"
 
 
+class SecurityReviewMode(StrEnum):
+    disabled = "disabled"
+    conditional = "conditional"
+    always = "always"
+
+
+class EvaluationCaseType(StrEnum):
+    good = "good"
+    bad = "bad"
+    adversarial = "adversarial"
+
+
+class EvaluationStatus(StrEnum):
+    running = "running"
+    completed = "completed"
+    failed = "failed"
+
+
 class AgentRole(StrEnum):
     code = "code_reviewer"
     security = "security_reviewer"
@@ -153,6 +171,31 @@ class PullRequestSnapshot(BaseModel):
         return sum(file.deletions for file in self.files)
 
 
+class ReviewPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    require_ticket_reference: bool = False
+    security_review: SecurityReviewMode = SecurityReviewMode.conditional
+    testing_review: bool = True
+    blocking_severities: list[Severity] = Field(
+        default_factory=lambda: [Severity.critical, Severity.high]
+    )
+    blocking_categories: list[Category] = Field(
+        default_factory=lambda: [Category.security, Category.correctness]
+    )
+    minimum_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    max_inline_comments: int = Field(default=50, ge=0, le=100)
+    publish_comments: bool = False
+
+
+class RepositoryPolicySummary(BaseModel):
+    allowlist_enabled: bool
+    allowed_repository_count: int
+    policy_file_configured: bool
+    repository_policy_count: int
+    default_policy: ReviewPolicy
+
+
 class ManualReviewRequest(BaseModel):
     pr_url: HttpUrl | None = None
     ticket_reference: str | None = Field(default=None, max_length=100)
@@ -228,6 +271,7 @@ class ReviewJob(BaseModel):
     pr_url: str
     head_sha: str
     installation_id: int | None = None
+    correlation_id: str | None = None
     status: JobStatus = JobStatus.queued
     attempts: int = 0
     max_attempts: int = 3
@@ -281,6 +325,101 @@ class PublicationResult(BaseModel):
     message: str
 
 
+class ExpectedFinding(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    line: int
+    category: Category
+
+
+class EvaluationCase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    name: str
+    case_type: EvaluationCaseType
+    description: str
+    pull_request: PullRequestSnapshot
+    expected_findings: list[ExpectedFinding]
+
+
+class EvaluationDataset(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: str
+    cases: list[EvaluationCase]
+
+
+class EvaluationCaseSummary(BaseModel):
+    id: str
+    name: str
+    case_type: EvaluationCaseType
+    description: str
+    expected_finding_count: int
+
+
+class EvaluationDatasetSummary(BaseModel):
+    version: str
+    case_count: int
+    good_cases: int
+    bad_cases: int
+    adversarial_cases: int
+    expected_finding_count: int
+    cases: list[EvaluationCaseSummary]
+
+
+class EvaluationCaseResult(BaseModel):
+    case_id: str
+    case_name: str
+    case_type: EvaluationCaseType
+    true_positives: int
+    false_positives: int
+    false_negatives: int
+    invalid_findings: int
+    accepted_findings: int
+    input_tokens: int
+    output_tokens: int
+    latency_ms: int
+    estimated_cost_usd: float
+    error_message: str | None = None
+
+
+class EvaluationRun(BaseModel):
+    id: str
+    status: EvaluationStatus
+    dataset_version: str
+    model: str
+    prompt_version: str
+    case_count: int
+    completed_cases: int = 0
+    true_positives: int = 0
+    false_positives: int = 0
+    false_negatives: int = 0
+    invalid_findings: int = 0
+    accepted_findings: int = 0
+    precision: float = 0.0
+    recall: float = 0.0
+    invalid_line_rate: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    latency_ms: int = 0
+    estimated_cost_usd: float = 0.0
+    results: list[EvaluationCaseResult] = Field(default_factory=list)
+    error_message: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    completed_at: datetime | None = None
+
+
+class EvaluationRunList(BaseModel):
+    items: list[EvaluationRun]
+    total: int
+
+
+class RunEvaluationRequest(BaseModel):
+    confirm_cost: Literal[True]
+
+
 class KnowledgeChunk(BaseModel):
     id: str
     document_id: str
@@ -301,6 +440,10 @@ class HealthResponse(BaseModel):
     worker_enabled: bool
     pending_jobs: int
     publishing_enabled: bool
+    allowlist_enabled: bool
+    policy_file_configured: bool
+    evaluation_dataset_ready: bool
+    evaluation_enabled: bool
     knowledge_documents: int
     dry_run_only: bool
     demo_mode_allowed: bool
@@ -317,6 +460,15 @@ class PublicConfig(BaseModel):
     webhook_configured: bool
     worker_enabled: bool
     publishing_enabled: bool
+    allowlist_enabled: bool
+    allowed_repository_count: int
+    policy_file_configured: bool
+    repository_policy_count: int
+    evaluation_dataset_ready: bool
+    evaluation_enabled: bool
+    evaluation_case_count: int
+    cost_estimation_configured: bool
+    structured_logging: bool
     dry_run_only: bool
     demo_mode_allowed: bool
     prompt_version: str

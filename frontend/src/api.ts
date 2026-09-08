@@ -1,5 +1,8 @@
 import type {
   Health,
+  EvaluationDatasetSummary,
+  EvaluationRun,
+  EvaluationRunList,
   KnowledgeDocument,
   KnowledgeDocumentList,
   PublicConfig,
@@ -34,6 +37,15 @@ export const api = {
   config: () => request<PublicConfig>("/api/config"),
   reviews: () => request<ReviewList>("/api/reviews?limit=50"),
   jobs: () => request<ReviewJobList>("/api/jobs?limit=50"),
+  evaluationDataset: () =>
+    request<EvaluationDatasetSummary>("/api/evaluations/dataset"),
+  evaluationRuns: () => request<EvaluationRunList>("/api/evaluations/runs?limit=20"),
+  runEvaluation: (evaluationToken: string) =>
+    request<EvaluationRun>("/api/evaluations/runs", {
+      method: "POST",
+      headers: { "X-MergeScope-Evaluation-Token": evaluationToken },
+      body: JSON.stringify({ confirm_cost: true }),
+    }),
   documents: () => request<KnowledgeDocumentList>("/api/knowledge/documents"),
   createReview: ({
     prUrl,

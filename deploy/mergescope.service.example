@@ -1,0 +1,21 @@
+[Unit]
+Description=MergeScope AI review workspace
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mergescope
+Group=mergescope
+WorkingDirectory=/opt/mergescope-ai
+EnvironmentFile=/opt/mergescope-ai/.env
+ExecStart=/opt/mergescope-ai/.venv/bin/uvicorn mergescope.main:app --app-dir backend/src --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/mergescope-ai/data /opt/mergescope-ai/backups
+
+[Install]
+WantedBy=multi-user.target

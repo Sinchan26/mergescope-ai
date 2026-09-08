@@ -5,7 +5,7 @@
 MergeScope AI is a local, Docker-free review workspace. It supports manual reviews and signed
 GitHub App events without requiring Jira, Redis, Docker, or an external job service.
 
-## Phase 3 workflow
+## Product workflow
 
 ```mermaid
 flowchart TD
@@ -22,6 +22,9 @@ the expected head SHA, runs the Phase 2 review graph, and records the resulting 
 is never automatic: it has its own server feature flag, preview endpoint, user confirmation, current
 head check, and recovery marker.
 
+Phase 4 adds a separate measurement loop: versioned local cases run through the same orchestrator,
+then exact path/line/category matching produces reproducible quality metrics stored in SQLite.
+
 ## Component map
 
 | Area | Responsibility | Implementation |
@@ -35,6 +38,10 @@ head check, and recovery marker.
 | Worker | Claim jobs and enforce expected PR heads | Async background task |
 | Publisher | Preview, confirm, revalidate head, create review | GitHub Reviews REST API |
 | Knowledge retrieval | Embed and rank repository-specific guidance | OpenAI embeddings + SQLite |
+| Evaluation runner | Labeled suite, exact matching, token/cost metrics | OpenAI + SQLite |
+| Policy registry | Allowlist and per-repository review behavior | Environment + JSON |
+| Observability | Request/job correlation and structured events | Context variables + JSON logs |
+| Backup | Online consistent copy, integrity check, retention | Python `sqlite3` backup API |
 
 ## Weekend delivery plan
 
@@ -73,13 +80,13 @@ published after explicit confirmation.
 
 ### Weekend 4 — evaluation and operational readiness
 
-- [ ] Create a labeled evaluation set with good, bad, and adversarial diffs
-- [ ] Measure precision, invalid-line rate, latency, and estimated model cost
-- [ ] Add request correlation IDs and structured logs
-- [ ] Add repository allowlists and configurable review policies
-- [ ] Package a non-Docker deployment and SQLite backup procedure
+- [x] Create a labeled evaluation set with good, bad, and adversarial diffs
+- [x] Measure precision, recall, invalid-line rate, latency, tokens, and estimated model cost
+- [x] Add request correlation IDs and structured logs
+- [x] Add repository allowlists and configurable review policies
+- [x] Package a non-Docker deployment and SQLite backup procedure
 
-Exit condition: review quality and failure behavior are measurable before broader use.
+Exit condition met: review quality and failure behavior are measurable before controlled expansion.
 
 ## Important engineering decisions
 
@@ -95,14 +102,26 @@ Exit condition: review quality and failure behavior are measurable before broade
 7. **Publication is recoverable.** A deterministic marker lets a retry detect an already-created
    GitHub review after a timeout.
 8. **Private keys stay outside version control.** The preferred setup references a local PEM path.
+9. **Evaluation costs require confirmation.** The evaluation route has a distinct operator token;
+   token prices are explicit configuration rather than hard-coded assumptions.
+10. **Policy is resolved before model work.** Disallowed repositories never enqueue or invoke the
+    review graph, repository overrides merge over a validated default, and the resolved policy is
+    part of cache and webhook-job identity.
+11. **Logs contain identifiers, not content.** Correlation IDs connect HTTP and background work
+    without recording diffs, prompts, payloads, or secrets.
+12. **Backups use SQLite's online API.** Every copy passes `integrity_check`, receives a SHA-256
+    manifest, and is pruned only after the new backup succeeds.
 
-## Phase 3 test path
+## Phase 4 test path
 
-1. Run the deterministic demo and confirm publication is blocked.
-2. Configure the GitHub App with publishing disabled.
-3. Deliver a signed `ping`, then open or update a PR.
-4. Open **Workflow center** and verify the job becomes completed with one result.
-5. Redeliver the same event and confirm no second job is created.
-6. Inspect the comment preview for exact paths and added lines.
-7. Enable publishing only in a test repository, restart the server, and explicitly confirm once.
-8. Push another commit and confirm the previous review can no longer publish.
+1. Load **Evaluation** and verify the six versioned cases are grouped as good, bad, and adversarial.
+2. Configure current model token rates and a separate evaluation operator token.
+3. Run the suite and inspect precision, recall, invalid-line rate, latency, tokens, and case details.
+4. Configure one repository in `ALLOWED_REPOSITORIES`; verify another repository is rejected before
+   OpenAI work and its signed webhook is ignored.
+5. Copy the policy example, enable publishing only for a test repository, and verify other repos
+   remain blocked even if the global publishing flag is on.
+6. Send an `X-Request-ID` and confirm the same value is returned and appears in structured logs.
+7. Run the backup CLI while the API is active; verify its JSON manifest and restore the copy into a
+   temporary database path.
+8. Run the full test, lint, frontend build, and dependency-audit commands.

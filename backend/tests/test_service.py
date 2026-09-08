@@ -12,6 +12,7 @@ from mergescope.domain.models import (
     ReviewResult,
     ReviewStatus,
 )
+from mergescope.services.policies import PolicyRegistry, RepositoryNotAllowedError
 from mergescope.services.reviews import ReviewService, StalePullRequestError
 
 
@@ -62,7 +63,9 @@ class FakeRetriever:
 class FakeOrchestrator:
     calls = 0
 
-    async def run(self, pull_request, context_sources, parsed_patches, ticket_reference):
+    async def run(
+        self, pull_request, context_sources, parsed_patches, ticket_reference, policy=None
+    ):
         self.calls += 1
         return (
             ReviewResult(
@@ -82,7 +85,9 @@ class FakeOrchestrator:
         )
 
 
-def build_service(tmp_path: Path, orchestrator=None) -> tuple[ReviewService, ReviewRepository]:
+def build_service(
+    tmp_path: Path, orchestrator=None, policies=None
+) -> tuple[ReviewService, ReviewRepository]:
     repository = ReviewRepository(tmp_path / "reviews.db")
     service = ReviewService(
         repository=repository,
@@ -93,6 +98,7 @@ def build_service(tmp_path: Path, orchestrator=None) -> tuple[ReviewService, Rev
         dry_run_only=True,
         demo_mode_allowed=True,
         prompt_version="test-v1",
+        policies=policies,
     )
     return service, repository
 
@@ -171,3 +177,21 @@ async def test_expected_webhook_head_rejects_superseded_pull_request(tmp_path: P
     runs = await repository.list()
     assert runs.total == 1
     assert runs.items[0].status is ReviewStatus.failed
+
+
+async def test_disallowed_manual_repository_is_rejected_before_run_creation(
+    tmp_path: Path,
+) -> None:
+    policies = PolicyRegistry(
+        path=tmp_path / "missing-policy.json",
+        allowed_repositories={"allowed/project"},
+    )
+    service, repository = build_service(tmp_path, FakeOrchestrator(), policies)
+    await repository.initialize()
+
+    with pytest.raises(RepositoryNotAllowedError, match="not present"):
+        await service.run_manual_review(
+            ManualReviewRequest(pr_url="https://github.com/example/project/pull/7")
+        )
+
+    assert (await repository.list()).total == 0

@@ -7,6 +7,8 @@ from mergescope.domain.models import (
     Category,
     PullRequestFile,
     PullRequestSnapshot,
+    ReviewPolicy,
+    SecurityReviewMode,
     Severity,
     SynthesizedReview,
 )
@@ -115,3 +117,19 @@ async def test_graph_skips_security_for_non_sensitive_change() -> None:
 
     assert client.roles == [AgentRole.code, AgentRole.testing]
     assert AgentRole.security not in result.agents_run
+
+
+async def test_graph_policy_can_skip_optional_specialists() -> None:
+    client = FakeReviewClient()
+    pr = pull_request()
+    policy = ReviewPolicy(
+        security_review=SecurityReviewMode.disabled,
+        testing_review=False,
+    )
+
+    result, *_ = await ReviewOrchestrator(client).run(
+        pr, [], parse_pull_request_patches(pr), None, policy
+    )
+
+    assert client.roles == [AgentRole.code]
+    assert result.agents_run == [AgentRole.code, AgentRole.synthesizer]

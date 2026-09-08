@@ -6,11 +6,11 @@ from mergescope.domain.models import (
     AgentReview,
     AgentRole,
     Approval,
-    Category,
     ContextSource,
     PullRequestSnapshot,
+    ReviewPolicy,
     ReviewResult,
-    Severity,
+    SecurityReviewMode,
     SynthesizedReview,
 )
 from mergescope.services.diff_parser import ParsedPatch, validate_findings
@@ -45,6 +45,7 @@ class ReviewGraphState(TypedDict, total=False):
     input_tokens: int
     output_tokens: int
     latency_ms: int
+    policy: ReviewPolicy
 
 
 class ReviewOrchestrator:
@@ -59,10 +60,18 @@ class ReviewOrchestrator:
         builder.add_edge(START, "code_reviewer")
         builder.add_conditional_edges(
             "code_reviewer",
-            self._security_route,
-            {"security_reviewer": "security_reviewer", "testing_reviewer": "testing_reviewer"},
+            self._after_code,
+            {
+                "security_reviewer": "security_reviewer",
+                "testing_reviewer": "testing_reviewer",
+                "synthesizer": "synthesizer",
+            },
         )
-        builder.add_edge("security_reviewer", "testing_reviewer")
+        builder.add_conditional_edges(
+            "security_reviewer",
+            self._after_security,
+            {"testing_reviewer": "testing_reviewer", "synthesizer": "synthesizer"},
+        )
         builder.add_edge("testing_reviewer", "synthesizer")
         builder.add_edge("synthesizer", "validator")
         builder.add_edge("validator", END)
@@ -74,6 +83,7 @@ class ReviewOrchestrator:
         context_sources: list[ContextSource],
         parsed_patches: dict[str, ParsedPatch],
         ticket_reference: str | None,
+        policy: ReviewPolicy | None = None,
     ) -> tuple[ReviewResult, int, int, int]:
         state = await self.graph.ainvoke(
             {
@@ -86,6 +96,7 @@ class ReviewOrchestrator:
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "latency_ms": 0,
+                "policy": policy or ReviewPolicy(),
             }
         )
         return (
@@ -122,9 +133,14 @@ class ReviewOrchestrator:
             "latency_ms": state["latency_ms"] + latency_ms,
         }
 
-    def _security_route(
+    def _after_code(
         self, state: ReviewGraphState
-    ) -> Literal["security_reviewer", "testing_reviewer"]:
+    ) -> Literal["security_reviewer", "testing_reviewer", "synthesizer"]:
+        policy = state["policy"]
+        if policy.security_review is SecurityReviewMode.always:
+            return "security_reviewer"
+        if policy.security_review is SecurityReviewMode.disabled:
+            return "testing_reviewer" if policy.testing_review else "synthesizer"
         security_terms = (
             "auth",
             "token",
@@ -146,7 +162,13 @@ class ReviewOrchestrator:
                 return "security_reviewer"
             if any(file.filename.lower().endswith(extension) for extension in security_extensions):
                 return "security_reviewer"
-        return "testing_reviewer"
+        return "testing_reviewer" if policy.testing_review else "synthesizer"
+
+    @staticmethod
+    def _after_security(
+        state: ReviewGraphState,
+    ) -> Literal["testing_reviewer", "synthesizer"]:
+        return "testing_reviewer" if state["policy"].testing_review else "synthesizer"
 
     async def _synthesizer(self, state: ReviewGraphState) -> ReviewGraphState:
         synthesis, input_tokens, output_tokens, latency_ms = await self.client.synthesize(
@@ -167,9 +189,11 @@ class ReviewOrchestrator:
             for issue in review.issues
         ]
         issues, rejected = validate_findings(candidates, state["parsed_patches"])
+        policy = state["policy"]
+        blocking_severities = set(policy.blocking_severities)
+        blocking_categories = set(policy.blocking_categories)
         blocking = any(
-            issue.severity in {Severity.critical, Severity.high}
-            and issue.category in {Category.security, Category.correctness}
+            issue.severity in blocking_severities and issue.category in blocking_categories
             for issue in issues
         )
         approval = (
@@ -180,6 +204,8 @@ class ReviewOrchestrator:
             else Approval.approve
         )
         synthesis = state["synthesis"]
+        if synthesis.confidence < policy.minimum_confidence and approval is Approval.approve:
+            approval = Approval.comment
         changed_paths = {file.filename for file in state["pull_request"].files}
         reviewed_files = [path for path in synthesis.reviewed_files if path in changed_paths]
         if not reviewed_files:

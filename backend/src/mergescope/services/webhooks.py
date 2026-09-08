@@ -4,8 +4,10 @@ import json
 from typing import Any
 from uuid import uuid4
 
+from mergescope.core.logging import correlation_id
 from mergescope.db.repository import ReviewRepository
 from mergescope.domain.models import ReviewJob, WebhookReceipt
+from mergescope.services.policies import PolicyRegistry
 
 SUPPORTED_ACTIONS = {"opened", "reopened", "ready_for_review", "synchronize"}
 
@@ -24,6 +26,8 @@ class WebhookService:
         max_attempts: int,
         max_body_bytes: int,
         notify_worker,
+        policies: PolicyRegistry | None = None,
+        model: str = "",
     ) -> None:
         self.repository = repository
         self.secret = secret
@@ -31,6 +35,8 @@ class WebhookService:
         self.max_attempts = max_attempts
         self.max_body_bytes = max_body_bytes
         self.notify_worker = notify_worker
+        self.policies = policies
+        self.model = model
 
     async def ingest(
         self,
@@ -78,13 +84,25 @@ class WebhookService:
             )
 
         repository_name, number, url, head_sha = self._pull_request_fields(payload, pull_request)
+        if self.policies and not self.policies.is_allowed(repository_name):
+            return WebhookReceipt(
+                delivery_id=delivery_id,
+                accepted=False,
+                message=f"Repository {repository_name} is not allowlisted.",
+            )
         installation = payload.get("installation")
         installation_id = (
             int(installation["id"])
             if isinstance(installation, dict) and installation.get("id") is not None
             else None
         )
-        key_source = f"{repository_name}:{number}:{head_sha}:{self.prompt_version}"
+        policy_fingerprint = (
+            self.policies.fingerprint(repository_name) if self.policies else "default"
+        )
+        key_source = (
+            f"{repository_name}:{number}:{head_sha}:{self.model}:{self.prompt_version}:"
+            f"{policy_fingerprint}"
+        )
         job = ReviewJob(
             id=str(uuid4()),
             idempotency_key=hashlib.sha256(key_source.encode()).hexdigest(),
@@ -94,6 +112,7 @@ class WebhookService:
             pr_url=url,
             head_sha=head_sha,
             installation_id=installation_id,
+            correlation_id=correlation_id(),
             max_attempts=self.max_attempts,
         )
         stored, duplicate = await self.repository.enqueue_webhook_job(job, event_name, action)

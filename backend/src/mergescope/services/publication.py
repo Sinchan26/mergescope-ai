@@ -11,6 +11,7 @@ from mergescope.domain.models import (
 )
 from mergescope.integrations.github import GitHubClient, GitHubError
 from mergescope.integrations.github_app import GitHubAppAuth, GitHubAppError
+from mergescope.services.policies import PolicyRegistry
 
 MAX_INLINE_COMMENTS = 50
 
@@ -27,11 +28,13 @@ class PublicationService:
         github: GitHubClient,
         app_auth: GitHubAppAuth | None,
         publishing_enabled: bool,
+        policies: PolicyRegistry | None = None,
     ) -> None:
         self.repository = repository
         self.github = github
         self.app_auth = app_auth
         self.publishing_enabled = publishing_enabled
+        self.policies = policies
 
     def preview(self, review: ReviewRun) -> PublicationPreview:
         reasons: list[str] = []
@@ -45,6 +48,12 @@ class PublicationService:
             reasons.append("GitHub App authentication is not configured.")
         if not review.repository or review.pr_number is None or not review.head_sha:
             reasons.append("The review is missing GitHub pull-request metadata.")
+        max_inline_comments = MAX_INLINE_COMMENTS
+        if self.policies and review.repository:
+            policy = self.policies.policy_for(review.repository)
+            max_inline_comments = policy.max_inline_comments
+            if not policy.publish_comments:
+                reasons.append("Comment publishing is disabled by this repository's policy.")
         if review.publication_status is PublicationStatus.published:
             reasons.append("This review has already been published.")
         if review.publication_status is PublicationStatus.stale:
@@ -65,11 +74,11 @@ class PublicationService:
                 )
                 for issue in review.result.issues
                 if issue.line_validated and issue.line_number is not None
-            ][:MAX_INLINE_COMMENTS]
+            ][:max_inline_comments]
         return PublicationPreview(
             review_id=review.id,
             commit_sha=review.head_sha,
-            body=self._summary_body(review),
+            body=self._summary_body(review, max_inline_comments),
             comments=comments,
             can_publish=not reasons,
             blocking_reasons=reasons,
@@ -170,14 +179,14 @@ class PublicationService:
         )
 
     @staticmethod
-    def _summary_body(review: ReviewRun) -> str:
+    def _summary_body(review: ReviewRun, max_inline_comments: int) -> str:
         if review.result is None:
             return "MergeScope AI review is not available."
         approval = review.result.approval.value.replace("_", " ").title()
         count = len(review.result.issues)
         truncation = (
-            f"\n\nOnly the first {MAX_INLINE_COMMENTS} findings are included inline."
-            if count > MAX_INLINE_COMMENTS
+            f"\n\nOnly the first {max_inline_comments} findings are included inline."
+            if count > max_inline_comments
             else ""
         )
         return (

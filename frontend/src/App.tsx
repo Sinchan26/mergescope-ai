@@ -9,6 +9,7 @@ import {
   ChevronRight,
   CircleDot,
   DatabaseZap,
+  FlaskConical,
   GitPullRequest,
   History,
   LayoutDashboard,
@@ -23,12 +24,15 @@ import {
   XCircle,
 } from "lucide-react";
 import { api } from "./api";
+import { EvaluationCenter } from "./components/EvaluationCenter";
 import { KnowledgeBase } from "./components/KnowledgeBase";
 import { ReviewInspector } from "./components/ReviewInspector";
 import { StatusBadge, humanize } from "./components/StatusBadge";
 import { WorkflowCenter } from "./components/WorkflowCenter";
 import type {
   Health,
+  EvaluationDatasetSummary,
+  EvaluationRun,
   KnowledgeDocument,
   PublicationResult,
   PublicConfig,
@@ -36,7 +40,7 @@ import type {
   ReviewRun,
 } from "./types";
 
-type View = "overview" | "knowledge" | "automation";
+type View = "overview" | "knowledge" | "automation" | "evaluation";
 
 const formatDate = (value: string) =>
   new Intl.DateTimeFormat(undefined, {
@@ -53,6 +57,8 @@ function App() {
   const [reviews, setReviews] = useState<ReviewRun[]>([]);
   const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
   const [jobs, setJobs] = useState<ReviewJob[]>([]);
+  const [evaluationDataset, setEvaluationDataset] = useState<EvaluationDatasetSummary | null>(null);
+  const [evaluationRuns, setEvaluationRuns] = useState<EvaluationRun[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [prUrl, setPrUrl] = useState("");
   const [ticketReference, setTicketReference] = useState("");
@@ -60,6 +66,7 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [evaluationRunning, setEvaluationRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -75,14 +82,16 @@ function App() {
   const loadDashboard = async () => {
     setLoading(true);
     try {
-      const [nextHealth, nextConfig, nextReviews, nextDocuments, nextJobs] = await Promise.all([
-        api.health(), api.config(), api.reviews(), api.documents(), api.jobs(),
+      const [nextHealth, nextConfig, nextReviews, nextDocuments, nextJobs, nextDataset, nextEvaluationRuns] = await Promise.all([
+        api.health(), api.config(), api.reviews(), api.documents(), api.jobs(), api.evaluationDataset().catch(() => null), api.evaluationRuns().catch(() => null),
       ]);
       setHealth(nextHealth);
       setConfig(nextConfig);
       setReviews(nextReviews.items);
       setDocuments(nextDocuments.items);
       setJobs(nextJobs.items);
+      setEvaluationDataset(nextDataset);
+      setEvaluationRuns(nextEvaluationRuns?.items ?? []);
       setSelectedId((current) => current ?? nextReviews.items[0]?.id ?? null);
       setError(null);
     } catch (loadError) {
@@ -163,6 +172,7 @@ function App() {
     setView(nextView);
     setMobileNavOpen(false);
     window.scrollTo({ top: 0, behavior: "smooth" });
+    requestAnimationFrame(() => document.getElementById("main-content")?.focus());
   };
 
   const openJobReview = (reviewId: string) => {
@@ -181,6 +191,27 @@ function App() {
     setNotice(result.message);
   };
 
+  const runEvaluation = async (operatorToken: string) => {
+    setEvaluationRunning(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await api.runEvaluation(operatorToken);
+      setEvaluationRuns((current) => [result, ...current.filter((run) => run.id !== result.id)]);
+      if (result.status === "completed") {
+        setNotice(`Evaluation completed with ${Math.round(result.precision * 100)}% precision and ${Math.round(result.recall * 100)}% recall.`);
+      } else {
+        setError(result.error_message ?? "One or more evaluation cases failed.");
+      }
+    } catch (runError) {
+      setError(runError instanceof Error ? runError.message : "The evaluation suite could not run.");
+      const refreshed = await api.evaluationRuns().catch(() => null);
+      if (refreshed) setEvaluationRuns(refreshed.items);
+    } finally {
+      setEvaluationRunning(false);
+    }
+  };
+
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-content">Skip to main content</a>
@@ -195,15 +226,16 @@ function App() {
           <button className="nav-item" onClick={() => { navigate("overview"); requestAnimationFrame(() => document.getElementById("new-review")?.scrollIntoView()); }}><GitPullRequest size={18} />New review</button>
           <button className={`nav-item ${view === "knowledge" ? "active" : ""}`} onClick={() => navigate("knowledge")}><BookOpen size={18} />Knowledge base<span className="nav-count">{documents.length}</span></button>
           <button className={`nav-item ${view === "automation" ? "active" : ""}`} onClick={() => navigate("automation")}><Webhook size={18} />Workflow center<span className="nav-count">{health?.pending_jobs ?? 0}</span></button>
+          <button className={`nav-item ${view === "evaluation" ? "active" : ""}`} onClick={() => navigate("evaluation")}><FlaskConical size={18} />Evaluation<span className="nav-count">{evaluationDataset?.case_count ?? 0}</span></button>
           <button className="nav-item" onClick={() => { navigate("overview"); requestAnimationFrame(() => document.getElementById("history")?.scrollIntoView()); }}><History size={18} />Review history</button>
         </nav>
         <div className="sidebar-section">
-          <p>Phase 3</p>
-          <div className="phase-progress"><span aria-hidden="true" /><small>3 of 4 · GitHub workflow</small></div>
+          <p>Phase 4</p>
+          <div className="phase-progress"><span aria-hidden="true" /><small>4 of 4 · Operational readiness</small></div>
         </div>
         <div className="sidebar-status">
           <div className="status-line"><span className={`health-dot ${health?.status === "ready" ? "online" : ""}`} /><span>{health?.status === "ready" ? "API operational" : "API unavailable"}</span></div>
-          <span>{config?.environment ?? "development"} · {config?.prompt_version ?? "phase2"}</span>
+          <span>{config?.environment ?? "development"} · {config?.prompt_version ?? "phase4"}</span>
         </div>
       </aside>
       {mobileNavOpen && <button className="nav-backdrop" aria-label="Close navigation" onClick={() => setMobileNavOpen(false)} />}
@@ -211,7 +243,7 @@ function App() {
       <main className="main-content" id="main-content" tabIndex={-1}>
         <header className="topbar">
           <button className="icon-button menu-button" aria-label="Open navigation" onClick={() => setMobileNavOpen(true)}><Menu size={20} /></button>
-          <div><p className="eyebrow">{view === "overview" ? "Review workspace" : view === "knowledge" ? "Grounding workspace" : "Automation workspace"}</p><h1>{view === "overview" ? "Pull request overview" : view === "knowledge" ? "Knowledge management" : "GitHub workflow operations"}</h1></div>
+          <div><p className="eyebrow">{view === "overview" ? "Review workspace" : view === "knowledge" ? "Grounding workspace" : view === "automation" ? "Automation workspace" : "Quality workspace"}</p><h1>{view === "overview" ? "Pull request overview" : view === "knowledge" ? "Knowledge management" : view === "automation" ? "GitHub workflow operations" : "Evaluation and operations"}</h1></div>
           <div className="topbar-actions">
             <div className="model-chip"><Bot size={16} /><span>{config?.openai_model ?? "Loading model"}</span></div>
             <button className="icon-button" onClick={() => void loadDashboard()} aria-label="Refresh dashboard"><RefreshCw size={18} className={loading ? "spin" : ""} /></button>
@@ -225,6 +257,8 @@ function App() {
           <KnowledgeBase documents={documents} config={config} uploading={uploading} onUpload={uploadDocument} onDelete={deleteDocument} />
         ) : view === "automation" ? (
           <WorkflowCenter config={config} health={health} jobs={jobs} loading={loading} onRefresh={() => void loadDashboard()} onOpenReview={openJobReview} />
+        ) : view === "evaluation" ? (
+          <EvaluationCenter config={config} dataset={evaluationDataset} runs={evaluationRuns} running={evaluationRunning} onRun={(operatorToken) => void runEvaluation(operatorToken)} onRefresh={() => void loadDashboard()} />
         ) : (
           <>
             {!config?.openai_configured && !loading && (
@@ -249,7 +283,7 @@ function App() {
                 <label className="checkbox-option"><input type="checkbox" checked={forceRereview} onChange={(event) => setForceRereview(event.target.checked)} /><span>Force re-review and ignore cache</span></label>
                 {config?.demo_mode_allowed && <button type="button" className="secondary-button" disabled={submitting} onClick={() => void executeReview(true)}><Activity size={16} />Run deterministic demo</button>}
               </div>
-              <p className="form-note">No GitHub comments are created. Cache identity uses repository, PR number, head SHA and prompt version.</p>
+              <p className="form-note">No GitHub comments are created. Cache identity includes the PR head, model, prompt, and resolved policy.</p>
             </section>
 
             <section className="metrics-grid" aria-label="Review summary">
@@ -263,7 +297,7 @@ function App() {
               <article className="panel history-panel">
                 <div className="section-heading compact"><div><p className="eyebrow">Latest activity</p><h2>Review history</h2></div><span className="record-count">{reviews.length} records</span></div>
                 {loading ? <div className="empty-state"><LoaderCircle size={26} className="spin" /><h3>Loading workspace</h3></div> : reviews.length === 0 ? (
-                  <div className="empty-state"><div className="empty-icon"><SearchCode size={25} /></div><h3>No reviews yet</h3><p>Run the deterministic demo to explore the complete Phase 2 workflow without credentials.</p><button className="text-button" onClick={() => void executeReview(true)}>Run demo <ArrowRight size={15} /></button></div>
+                  <div className="empty-state"><div className="empty-icon"><SearchCode size={25} /></div><h3>No reviews yet</h3><p>Run the deterministic demo to explore the complete grounded-review workflow without credentials.</p><button className="text-button" onClick={() => void executeReview(true)}>Run demo <ArrowRight size={15} /></button></div>
                 ) : (
                   <div className="table-wrap"><table><thead><tr><th>Pull request</th><th>Status</th><th>Source</th><th>Verdict</th><th>Issues</th><th>Run at</th><th><span className="sr-only">Open</span></th></tr></thead><tbody>
                     {reviews.map((review) => <tr key={review.id} className={selected?.id === review.id ? "selected-row" : ""}>

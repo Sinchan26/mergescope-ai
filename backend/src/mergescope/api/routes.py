@@ -17,6 +17,9 @@ from fastapi import (
 from mergescope.core.config import Settings, get_settings
 from mergescope.db.repository import ReviewRepository
 from mergescope.domain.models import (
+    EvaluationDatasetSummary,
+    EvaluationRun,
+    EvaluationRunList,
     HealthResponse,
     KnowledgeDocument,
     KnowledgeDocumentList,
@@ -25,14 +28,18 @@ from mergescope.domain.models import (
     PublicationResult,
     PublicConfig,
     PublishReviewRequest,
+    RepositoryPolicySummary,
     ReviewJobList,
     ReviewList,
     ReviewRun,
+    RunEvaluationRequest,
     WebhookReceipt,
 )
 from mergescope.integrations.github import GitHubError
 from mergescope.integrations.openai_review import OpenAIReviewError
+from mergescope.services.evaluations import EvaluationError, EvaluationService
 from mergescope.services.knowledge import KnowledgeService
+from mergescope.services.policies import PolicyRegistry
 from mergescope.services.publication import PublicationError, PublicationService
 from mergescope.services.reviews import ReviewService
 from mergescope.services.webhooks import WebhookError, WebhookService
@@ -60,16 +67,31 @@ def get_publication_service(request: Request) -> PublicationService:
     return request.app.state.publication_service
 
 
+def get_evaluation_service(request: Request) -> EvaluationService:
+    return request.app.state.evaluation_service
+
+
+def get_policy_registry(request: Request) -> PolicyRegistry:
+    return request.app.state.policy_registry
+
+
 RepositoryDep = Annotated[ReviewRepository, Depends(get_repository)]
 ReviewServiceDep = Annotated[ReviewService, Depends(get_review_service)]
 KnowledgeServiceDep = Annotated[KnowledgeService, Depends(get_knowledge_service)]
 WebhookServiceDep = Annotated[WebhookService, Depends(get_webhook_service)]
 PublicationServiceDep = Annotated[PublicationService, Depends(get_publication_service)]
+EvaluationServiceDep = Annotated[EvaluationService, Depends(get_evaluation_service)]
+PolicyRegistryDep = Annotated[PolicyRegistry, Depends(get_policy_registry)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 
 
 @router.get("/health", response_model=HealthResponse)
-async def health(repository: RepositoryDep, settings: SettingsDep) -> HealthResponse:
+async def health(
+    repository: RepositoryDep,
+    settings: SettingsDep,
+    policies: PolicyRegistryDep,
+    evaluations: EvaluationServiceDep,
+) -> HealthResponse:
     database_ready = await repository.ping()
     return HealthResponse(
         status="ready" if database_ready else "degraded",
@@ -83,6 +105,12 @@ async def health(repository: RepositoryDep, settings: SettingsDep) -> HealthResp
         publishing_enabled=bool(
             settings.github_publishing_enabled and settings.publish_confirmation_token
         ),
+        allowlist_enabled=policies.allowlist_enabled,
+        policy_file_configured=policies.policy_file_configured,
+        evaluation_dataset_ready=evaluations.dataset_ready,
+        evaluation_enabled=bool(
+            settings.openai_api_key and settings.evaluation_run_token and evaluations.dataset_ready
+        ),
         knowledge_documents=await repository.document_count() if database_ready else 0,
         dry_run_only=settings.dry_run_only,
         demo_mode_allowed=settings.demo_mode_allowed,
@@ -90,7 +118,15 @@ async def health(repository: RepositoryDep, settings: SettingsDep) -> HealthResp
 
 
 @router.get("/config", response_model=PublicConfig)
-async def public_config(settings: SettingsDep) -> PublicConfig:
+async def public_config(
+    settings: SettingsDep,
+    policies: PolicyRegistryDep,
+    evaluations: EvaluationServiceDep,
+) -> PublicConfig:
+    policy_summary = policies.summary()
+    evaluation_case_count = (
+        evaluations.dataset_summary().case_count if evaluations.dataset_ready else 0
+    )
     return PublicConfig(
         app_name=settings.app_name,
         environment=settings.app_env,
@@ -104,6 +140,19 @@ async def public_config(settings: SettingsDep) -> PublicConfig:
         publishing_enabled=bool(
             settings.github_publishing_enabled and settings.publish_confirmation_token
         ),
+        allowlist_enabled=policy_summary.allowlist_enabled,
+        allowed_repository_count=policy_summary.allowed_repository_count,
+        policy_file_configured=policy_summary.policy_file_configured,
+        repository_policy_count=policy_summary.repository_policy_count,
+        evaluation_dataset_ready=evaluations.dataset_ready,
+        evaluation_enabled=bool(
+            settings.openai_api_key and settings.evaluation_run_token and evaluations.dataset_ready
+        ),
+        evaluation_case_count=evaluation_case_count,
+        cost_estimation_configured=bool(
+            settings.openai_input_cost_per_million or settings.openai_output_cost_per_million
+        ),
+        structured_logging=settings.log_json,
         dry_run_only=settings.dry_run_only,
         demo_mode_allowed=settings.demo_mode_allowed,
         prompt_version=settings.prompt_version,
@@ -187,6 +236,58 @@ async def list_jobs(
     limit: Annotated[int, Query(ge=1, le=100)] = 25,
 ) -> ReviewJobList:
     return await repository.list_jobs(limit=limit)
+
+
+@router.get("/policies", response_model=RepositoryPolicySummary)
+async def policy_summary(policies: PolicyRegistryDep) -> RepositoryPolicySummary:
+    return policies.summary()
+
+
+@router.get("/evaluations/dataset", response_model=EvaluationDatasetSummary)
+async def evaluation_dataset(service: EvaluationServiceDep) -> EvaluationDatasetSummary:
+    try:
+        return service.dataset_summary()
+    except EvaluationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+
+
+@router.get("/evaluations/runs", response_model=EvaluationRunList)
+async def evaluation_runs(
+    repository: RepositoryDep,
+    limit: Annotated[int, Query(ge=1, le=50)] = 20,
+) -> EvaluationRunList:
+    return await repository.list_evaluation_runs(limit=limit)
+
+
+@router.post("/evaluations/runs", response_model=EvaluationRun, status_code=status.HTTP_201_CREATED)
+async def run_evaluation(
+    payload: RunEvaluationRequest,
+    service: EvaluationServiceDep,
+    settings: SettingsDep,
+    evaluation_token: Annotated[str | None, Header(alias="X-MergeScope-Evaluation-Token")] = None,
+) -> EvaluationRun:
+    if payload.confirm_cost is not True:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OpenAI evaluation cost confirmation is required.",
+        )
+    expected = settings.evaluation_run_token
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Evaluation runs are disabled until EVALUATION_RUN_TOKEN is configured.",
+        )
+    if evaluation_token is None or not secrets.compare_digest(evaluation_token, expected):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="The evaluation operator token is missing or incorrect.",
+        )
+    try:
+        return await service.run()
+    except EvaluationError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
 @router.post(

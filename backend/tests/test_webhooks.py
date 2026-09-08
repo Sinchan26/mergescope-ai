@@ -4,8 +4,10 @@ import json
 from pathlib import Path
 
 import pytest
+from mergescope.core.logging import bind_correlation_id
 from mergescope.db.repository import ReviewRepository
 from mergescope.domain.models import JobStatus
+from mergescope.services.policies import PolicyRegistry
 from mergescope.services.webhooks import WebhookError, WebhookService
 
 
@@ -48,12 +50,13 @@ async def test_signed_webhook_is_queued_and_deduplicated(tmp_path: Path) -> None
     )
     body = pull_request_payload()
 
-    first = await service.ingest(
-        delivery_id="delivery-1",
-        event_name="pull_request",
-        signature=signature("webhook-secret", body),
-        body=body,
-    )
+    with bind_correlation_id("phase4-webhook-request"):
+        first = await service.ingest(
+            delivery_id="delivery-1",
+            event_name="pull_request",
+            signature=signature("webhook-secret", body),
+            body=body,
+        )
     repeated_delivery = await service.ingest(
         delivery_id="delivery-1",
         event_name="pull_request",
@@ -75,6 +78,7 @@ async def test_signed_webhook_is_queued_and_deduplicated(tmp_path: Path) -> None
     jobs = await repository.list_jobs()
     assert jobs.total == 1
     assert jobs.items[0].installation_id == 501
+    assert jobs.items[0].correlation_id == "phase4-webhook-request"
     assert notifications == 3
 
 
@@ -107,6 +111,36 @@ async def test_webhook_rejects_bad_signature_and_ignores_drafts(tmp_path: Path) 
         body=draft,
     )
     assert receipt.accepted is False
+    assert (await repository.list_jobs()).total == 0
+
+
+async def test_allowlist_ignores_signed_webhook_before_enqueue(tmp_path: Path) -> None:
+    repository = ReviewRepository(tmp_path / "reviews.db")
+    await repository.initialize()
+    policies = PolicyRegistry(
+        path=tmp_path / "missing-policies.json",
+        allowed_repositories={"allowed/project"},
+    )
+    service = WebhookService(
+        repository=repository,
+        secret="secret",
+        prompt_version="phase4-test",
+        max_attempts=3,
+        max_body_bytes=50_000,
+        notify_worker=lambda: None,
+        policies=policies,
+    )
+    body = pull_request_payload()
+
+    receipt = await service.ingest(
+        delivery_id="not-allowed",
+        event_name="pull_request",
+        signature=signature("secret", body),
+        body=body,
+    )
+
+    assert receipt.accepted is False
+    assert "not allowlisted" in receipt.message
     assert (await repository.list_jobs()).total == 0
 
 

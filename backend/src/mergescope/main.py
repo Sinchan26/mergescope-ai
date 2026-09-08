@@ -1,8 +1,10 @@
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from time import perf_counter
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -10,24 +12,33 @@ from fastapi.staticfiles import StaticFiles
 from mergescope.agents.review_graph import ReviewOrchestrator
 from mergescope.api.routes import router
 from mergescope.core.config import get_settings
+from mergescope.core.logging import bind_correlation_id, configure_logging
 from mergescope.db.repository import ReviewRepository
 from mergescope.integrations.embeddings import OpenAIEmbedder
 from mergescope.integrations.github import GitHubClient
 from mergescope.integrations.github_app import GitHubAppAuth
 from mergescope.integrations.openai_review import OpenAIReviewClient
+from mergescope.services.evaluations import EvaluationService
 from mergescope.services.knowledge import KnowledgeRetriever, KnowledgeService
+from mergescope.services.policies import PolicyRegistry
 from mergescope.services.publication import PublicationService
 from mergescope.services.reviews import ReviewService
 from mergescope.services.webhooks import WebhookService
 from mergescope.services.worker import ReviewWorker
 
 settings = get_settings()
+configure_logging(settings.log_level, json_logs=settings.log_json)
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     repository = ReviewRepository(settings.resolved_database_path)
     await repository.initialize()
+    policies = PolicyRegistry(
+        path=settings.resolved_review_policies_path,
+        allowed_repositories=settings.allowed_repository_set,
+    )
     private_key = settings.resolved_github_private_key
     app_auth = (
         GitHubAppAuth(
@@ -74,15 +85,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     retriever = KnowledgeRetriever(repository=repository, embedder=embedder)
     app.state.repository = repository
     app.state.knowledge_service = knowledge_service
+    orchestrator = ReviewOrchestrator(review_client) if review_client else None
     review_service = ReviewService(
         repository=repository,
         github=github,
-        orchestrator=ReviewOrchestrator(review_client) if review_client else None,
+        orchestrator=orchestrator,
         retriever=retriever,
         model=settings.openai_model,
         dry_run_only=settings.dry_run_only,
         demo_mode_allowed=settings.demo_mode_allowed,
         prompt_version=settings.prompt_version,
+        policies=policies,
     )
     worker = ReviewWorker(
         repository=repository,
@@ -91,6 +104,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         lease_seconds=settings.worker_lease_seconds,
     )
     app.state.review_service = review_service
+    app.state.policy_registry = policies
     app.state.review_worker = worker
     app.state.webhook_service = WebhookService(
         repository=repository,
@@ -99,6 +113,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         max_attempts=settings.worker_max_attempts,
         max_body_bytes=settings.webhook_max_bytes,
         notify_worker=worker.notify,
+        policies=policies,
+        model=settings.openai_model,
     )
     app.state.publication_service = PublicationService(
         repository=repository,
@@ -107,6 +123,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         publishing_enabled=bool(
             settings.github_publishing_enabled and settings.publish_confirmation_token
         ),
+        policies=policies,
+    )
+    app.state.evaluation_service = EvaluationService(
+        repository=repository,
+        orchestrator=orchestrator,
+        dataset_path=settings.resolved_evaluation_dataset_path,
+        model=settings.openai_model,
+        prompt_version=settings.prompt_version,
+        input_cost_per_million=settings.openai_input_cost_per_million,
+        output_cost_per_million=settings.openai_output_cost_per_million,
     )
     worker_task = asyncio.create_task(worker.run()) if settings.worker_enabled else None
     try:
@@ -123,10 +149,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.3.0",
+    version="0.4.0",
     description="Grounded, Docker-free pull-request review and GitHub workflow API",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def request_logging(request: Request, call_next):
+    started = perf_counter()
+    with bind_correlation_id(request.headers.get("X-Request-ID")) as request_id:
+        context = {
+            "event": "http_request",
+            "method": request.method,
+            "path": request.url.path,
+        }
+        try:
+            response = await call_next(request)
+        except Exception:
+            logger.exception("HTTP request failed.", extra=context)
+            raise
+        duration_ms = round((perf_counter() - started) * 1_000)
+        response.headers["X-Request-ID"] = request_id
+        logger.info(
+            "HTTP request completed.",
+            extra={**context, "status_code": response.status_code, "duration_ms": duration_ms},
+        )
+        return response
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 
+from mergescope.core.logging import bind_correlation_id
 from mergescope.db.repository import ReviewRepository
 from mergescope.domain.models import ManualReviewRequest, ReviewJob, TriggerSource
 from mergescope.services.reviews import ReviewService, StalePullRequestError
@@ -39,24 +40,37 @@ class ReviewWorker:
             await self._process(job)
 
     async def _process(self, job: ReviewJob) -> None:
-        try:
-            review = await self.review_service.run_manual_review(
-                ManualReviewRequest(pr_url=job.pr_url, force_rereview=False),
-                expected_head_sha=job.head_sha,
-                installation_id=job.installation_id,
-                trigger_source=TriggerSource.webhook,
-                job_id=job.id,
-            )
-            await self.repository.complete_job(job.id, review.id)
-        except StalePullRequestError as exc:
-            await self.repository.supersede_job(job.id, str(exc))
-        except asyncio.CancelledError:
-            await asyncio.shield(
-                self.repository.fail_job(job, "Worker stopped before completion.", retryable=True)
-            )
-            raise
-        except ValueError as exc:
-            await self.repository.fail_job(job, str(exc), retryable=False)
-        except Exception as exc:
-            status = await self.repository.fail_job(job, str(exc), retryable=True)
-            logger.warning("Review job %s moved to %s: %s", job.id, status, exc)
+        with bind_correlation_id(job.correlation_id or job.delivery_id):
+            log_context = {
+                "event": "review_job_processing",
+                "job_id": job.id,
+                "repository": job.repository,
+                "pr_number": job.pr_number,
+            }
+            logger.info("Review job started.", extra=log_context)
+            try:
+                review = await self.review_service.run_manual_review(
+                    ManualReviewRequest(pr_url=job.pr_url, force_rereview=False),
+                    expected_head_sha=job.head_sha,
+                    installation_id=job.installation_id,
+                    trigger_source=TriggerSource.webhook,
+                    job_id=job.id,
+                )
+                await self.repository.complete_job(job.id, review.id)
+                logger.info("Review job completed.", extra=log_context)
+            except StalePullRequestError as exc:
+                await self.repository.supersede_job(job.id, str(exc))
+                logger.info("Review job superseded.", extra=log_context)
+            except asyncio.CancelledError:
+                await asyncio.shield(
+                    self.repository.fail_job(
+                        job, "Worker stopped before completion.", retryable=True
+                    )
+                )
+                raise
+            except ValueError as exc:
+                await self.repository.fail_job(job, str(exc), retryable=False)
+                logger.warning("Review job failed permanently: %s", exc, extra=log_context)
+            except Exception as exc:
+                status = await self.repository.fail_job(job, str(exc), retryable=True)
+                logger.warning("Review job moved to %s: %s", status, exc, extra=log_context)

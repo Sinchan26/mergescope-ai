@@ -31,6 +31,10 @@ export interface Health {
   worker_enabled: boolean;
   pending_jobs: number;
   publishing_enabled: boolean;
+  allowlist_enabled: boolean;
+  policy_file_configured: boolean;
+  evaluation_dataset_ready: boolean;
+  evaluation_enabled: boolean;
   knowledge_documents: number;
   dry_run_only: boolean;
   demo_mode_allowed: boolean;
@@ -47,6 +51,15 @@ export interface PublicConfig {
   webhook_configured: boolean;
   worker_enabled: boolean;
   publishing_enabled: boolean;
+  allowlist_enabled: boolean;
+  allowed_repository_count: number;
+  policy_file_configured: boolean;
+  repository_policy_count: number;
+  evaluation_dataset_ready: boolean;
+  evaluation_enabled: boolean;
+  evaluation_case_count: number;
+  cost_estimation_configured: boolean;
+  structured_logging: boolean;
   dry_run_only: boolean;
   demo_mode_allowed: boolean;
   prompt_version: string;
@@ -148,6 +161,7 @@ export interface ReviewJob {
   pr_url: string;
   head_sha: string;
   installation_id: number | null;
+  correlation_id: string | null;
   status: JobStatus;
   attempts: number;
   max_attempts: number;
@@ -187,4 +201,72 @@ export interface PublicationResult {
   github_review_id: number | null;
   published_at: string | null;
   message: string;
+}
+
+export type EvaluationCaseType = "good" | "bad" | "adversarial";
+export type EvaluationStatus = "running" | "completed" | "failed";
+
+export interface EvaluationCaseSummary {
+  id: string;
+  name: string;
+  case_type: EvaluationCaseType;
+  description: string;
+  expected_finding_count: number;
+}
+
+export interface EvaluationDatasetSummary {
+  version: string;
+  case_count: number;
+  good_cases: number;
+  bad_cases: number;
+  adversarial_cases: number;
+  expected_finding_count: number;
+  cases: EvaluationCaseSummary[];
+}
+
+export interface EvaluationCaseResult {
+  case_id: string;
+  case_name: string;
+  case_type: EvaluationCaseType;
+  true_positives: number;
+  false_positives: number;
+  false_negatives: number;
+  invalid_findings: number;
+  accepted_findings: number;
+  input_tokens: number;
+  output_tokens: number;
+  latency_ms: number;
+  estimated_cost_usd: number;
+  error_message: string | null;
+}
+
+export interface EvaluationRun {
+  id: string;
+  status: EvaluationStatus;
+  dataset_version: string;
+  model: string;
+  prompt_version: string;
+  case_count: number;
+  completed_cases: number;
+  true_positives: number;
+  false_positives: number;
+  false_negatives: number;
+  invalid_findings: number;
+  accepted_findings: number;
+  precision: number;
+  recall: number;
+  invalid_line_rate: number;
+  input_tokens: number;
+  output_tokens: number;
+  latency_ms: number;
+  estimated_cost_usd: number;
+  results: EvaluationCaseResult[];
+  error_message: string | null;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface EvaluationRunList {
+  items: EvaluationRun[];
+  total: number;
 }

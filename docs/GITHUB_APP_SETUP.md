@@ -36,11 +36,17 @@ GITHUB_APP_PRIVATE_KEY_PATH=C:/absolute/path/to/mergescope.private-key.pem
 GITHUB_WEBHOOK_SECRET=the-same-secret-entered-in-github
 GITHUB_PUBLISHING_ENABLED=false
 PUBLISH_CONFIRMATION_TOKEN=generate-a-separate-long-random-value
+ALLOWED_REPOSITORIES=your-org/test-repository
+REVIEW_POLICIES_PATH=config/review-policies.json
 WORKER_ENABLED=true
 ```
 
 Linux/macOS paths work normally. On Windows, either use forward slashes or a plain absolute path.
 Restart FastAPI after changing `.env`.
+
+Copy `config/review-policies.example.json` to `config/review-policies.json`, replace the example
+repository name, and set `publish_comments` to `true` only for the test repository you intend to
+write to. Phase 4 requires this repository policy in addition to the global publishing flag.
 
 ## 4. Install and verify
 
@@ -54,8 +60,8 @@ The supported PR actions are `opened`, `reopened`, `ready_for_review`, and `sync
 
 Keep publishing disabled while validating review quality. When ready:
 
-1. Set `GITHUB_PUBLISHING_ENABLED=true`, set a separate `PUBLISH_CONFIRMATION_TOKEN`, and restart
-   FastAPI.
+1. Set `GITHUB_PUBLISHING_ENABLED=true`, set a separate `PUBLISH_CONFIRMATION_TOKEN`, enable
+   `publish_comments` in that repository's policy, and restart FastAPI.
 2. Select a completed, non-demo review.
 3. Expand **Preview comments** and inspect every path, line, and message.
 4. Choose **Publish reviewed comments**, enter the publication token, and confirm the native dialog.

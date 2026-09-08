@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     github_webhook_secret: str | None = None
     github_publishing_enabled: bool = False
     publish_confirmation_token: str | None = None
+    allowed_repositories: str = ""
+    review_policies_path: Path = Path("config/review-policies.json")
     worker_enabled: bool = True
     worker_poll_seconds: float = Field(default=2.0, ge=0.25, le=60)
     worker_max_attempts: int = Field(default=3, ge=1, le=10)
@@ -45,7 +47,13 @@ class Settings(BaseSettings):
     max_diff_chars: int = Field(default=60_000, ge=10_000, le=200_000)
     max_document_bytes: int = Field(default=1_000_000, ge=1_000, le=5_000_000)
     github_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
-    prompt_version: str = "phase3-v1"
+    evaluation_dataset_path: Path = Path("evaluations/cases.json")
+    evaluation_run_token: str | None = None
+    openai_input_cost_per_million: float = Field(default=0.0, ge=0)
+    openai_output_cost_per_million: float = Field(default=0.0, ge=0)
+    log_level: str = "INFO"
+    log_json: bool = True
+    prompt_version: str = "phase4-v1"
 
     def resolve_path(self, value: Path) -> Path:
         return value if value.is_absolute() else PROJECT_ROOT / value
@@ -57,6 +65,20 @@ class Settings(BaseSettings):
     @property
     def resolved_frontend_dist_path(self) -> Path:
         return self.resolve_path(self.frontend_dist_path)
+
+    @property
+    def resolved_review_policies_path(self) -> Path:
+        return self.resolve_path(self.review_policies_path)
+
+    @property
+    def resolved_evaluation_dataset_path(self) -> Path:
+        return self.resolve_path(self.evaluation_dataset_path)
+
+    @property
+    def allowed_repository_set(self) -> set[str]:
+        return {
+            item.strip().lower() for item in self.allowed_repositories.split(",") if item.strip()
+        }
 
     @property
     def resolved_github_private_key(self) -> str | None:

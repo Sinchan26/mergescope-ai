@@ -7,14 +7,16 @@ from mergescope.db.repository import ReviewRepository
 from mergescope.domain.models import (
     ManualReviewRequest,
     PullRequestSnapshot,
+    ReviewPolicy,
     ReviewRun,
     ReviewStatus,
     TriggerSource,
 )
-from mergescope.integrations.github import GitHubClient
+from mergescope.integrations.github import GitHubClient, parse_github_pr_url
 from mergescope.services.demo import demo_pull_request, demo_result
 from mergescope.services.diff_parser import parse_pull_request_patches
 from mergescope.services.knowledge import KnowledgeRetriever
+from mergescope.services.policies import PolicyRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,7 @@ class ReviewService:
         dry_run_only: bool,
         demo_mode_allowed: bool,
         prompt_version: str,
+        policies: PolicyRegistry | None = None,
     ) -> None:
         self.repository = repository
         self.github = github
@@ -43,6 +46,7 @@ class ReviewService:
         self.dry_run_only = dry_run_only
         self.demo_mode_allowed = demo_mode_allowed
         self.prompt_version = prompt_version
+        self.policies = policies
 
     async def run_manual_review(
         self,
@@ -59,6 +63,16 @@ class ReviewService:
             raise ValueError("Demo mode is disabled on this server.")
         if not request.demo_mode and self.orchestrator is None:
             raise ValueError("OPENAI_API_KEY is not configured on the server.")
+
+        policy = ReviewPolicy()
+        if not request.demo_mode and request.pr_url:
+            owner, repository, _ = parse_github_pr_url(str(request.pr_url))
+            repository_name = f"{owner}/{repository}"
+            if self.policies:
+                self.policies.require_allowed(repository_name)
+                policy = self.policies.policy_for(repository_name)
+            if policy.require_ticket_reference and not request.ticket_reference:
+                raise ValueError(f"A ticket reference is required for {repository_name}.")
 
         run = ReviewRun(
             id=str(uuid4()),
@@ -92,7 +106,7 @@ class ReviewService:
                     f"{pull_request.head_sha[:12]}."
                 )
             self._apply_pull_request(run, pull_request)
-            run.cache_key = self._cache_key(pull_request)
+            run.cache_key = self._cache_key(pull_request, policy)
 
             if not request.demo_mode and not request.force_rereview:
                 cached = await self.repository.find_cached(run.cache_key)
@@ -121,6 +135,7 @@ class ReviewService:
                     context_sources,
                     parsed_patches,
                     run.ticket_reference,
+                    policy,
                 )
                 run.result = result
                 run.input_tokens = input_tokens
@@ -162,10 +177,11 @@ class ReviewService:
             return await self.github.fetch_pull_request(url)
         return await self.github.fetch_pull_request(url, installation_id=installation_id)
 
-    def _cache_key(self, pull_request: PullRequestSnapshot) -> str:
+    def _cache_key(self, pull_request: PullRequestSnapshot, policy: ReviewPolicy) -> str:
+        policy_fingerprint = hashlib.sha256(policy.model_dump_json().encode()).hexdigest()
         value = (
             f"{pull_request.repository}:{pull_request.number}:"
-            f"{pull_request.head_sha}:{self.prompt_version}"
+            f"{pull_request.head_sha}:{self.model}:{self.prompt_version}:{policy_fingerprint}"
         )
         return hashlib.sha256(value.encode()).hexdigest()
 

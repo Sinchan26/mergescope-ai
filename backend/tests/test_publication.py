@@ -4,6 +4,7 @@ import pytest
 from mergescope.db.repository import ReviewRepository
 from mergescope.domain.models import PublicationStatus, ReviewRun, ReviewStatus
 from mergescope.services.demo import demo_pull_request, demo_result
+from mergescope.services.policies import PolicyRegistry
 from mergescope.services.publication import PublicationError, PublicationService
 
 
@@ -104,3 +105,26 @@ async def test_publish_blocks_disabled_demo_and_stale_reviews(tmp_path: Path) ->
     saved = await repository.get(review.id)
     assert saved is not None
     assert saved.publication_status is PublicationStatus.stale
+
+
+async def test_repository_policy_is_a_separate_publication_lock(tmp_path: Path) -> None:
+    repository = ReviewRepository(tmp_path / "reviews.db")
+    await repository.initialize()
+    review = completed_review("policy-blocked-review")
+    await repository.create(review)
+    policies = PolicyRegistry(
+        path=tmp_path / "missing-policy.json",
+        allowed_repositories=set(),
+    )
+    service = PublicationService(
+        repository=repository,
+        github=FakeGitHub(),  # type: ignore[arg-type]
+        app_auth=FakeAppAuth(),  # type: ignore[arg-type]
+        publishing_enabled=True,
+        policies=policies,
+    )
+
+    preview = service.preview(review)
+
+    assert preview.can_publish is False
+    assert "repository's policy" in " ".join(preview.blocking_reasons)

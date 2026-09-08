@@ -8,6 +8,9 @@ from typing import Any
 import aiosqlite
 
 from mergescope.domain.models import (
+    EvaluationRun,
+    EvaluationRunList,
+    EvaluationStatus,
     JobStatus,
     KnowledgeChunk,
     KnowledgeDocument,
@@ -82,6 +85,7 @@ CREATE TABLE IF NOT EXISTS review_jobs (
     pr_url TEXT NOT NULL,
     head_sha TEXT NOT NULL,
     installation_id INTEGER,
+    correlation_id TEXT,
     status TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL DEFAULT 3,
@@ -102,6 +106,31 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     job_id TEXT,
     received_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS evaluation_runs (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    dataset_version TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    case_count INTEGER NOT NULL,
+    completed_cases INTEGER NOT NULL DEFAULT 0,
+    true_positives INTEGER NOT NULL DEFAULT 0,
+    false_positives INTEGER NOT NULL DEFAULT 0,
+    false_negatives INTEGER NOT NULL DEFAULT 0,
+    invalid_findings INTEGER NOT NULL DEFAULT 0,
+    accepted_findings INTEGER NOT NULL DEFAULT 0,
+    precision REAL NOT NULL DEFAULT 0,
+    recall REAL NOT NULL DEFAULT 0,
+    invalid_line_rate REAL NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    estimated_cost_usd REAL NOT NULL DEFAULT 0,
+    results_json TEXT NOT NULL DEFAULT '[]',
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
 """
 
 INDEX_SCHEMA = """
@@ -120,6 +149,8 @@ CREATE INDEX IF NOT EXISTS idx_review_jobs_available
     ON review_jobs(status, available_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_review_jobs_pull_request
     ON review_jobs(repository, pr_number, head_sha);
+CREATE INDEX IF NOT EXISTS idx_evaluation_runs_created_at
+    ON evaluation_runs(created_at DESC);
 """
 
 REVIEW_COLUMN_MIGRATIONS = {
@@ -135,6 +166,10 @@ REVIEW_COLUMN_MIGRATIONS = {
     "published_at": "TEXT",
 }
 
+JOB_COLUMN_MIGRATIONS = {
+    "correlation_id": "TEXT",
+}
+
 
 class ReviewRepository:
     def __init__(self, database_path: Path) -> None:
@@ -147,8 +182,19 @@ class ReviewRepository:
             await connection.execute("PRAGMA busy_timeout=30000")
             await connection.executescript(BASE_SCHEMA)
             await self._migrate_review_columns(connection)
+            await self._migrate_job_columns(connection)
             await connection.executescript(INDEX_SCHEMA)
             await connection.execute("PRAGMA journal_mode=WAL")
+            now = datetime.now(UTC).isoformat()
+            await connection.execute(
+                """
+                UPDATE evaluation_runs
+                SET status = 'failed', error_message = 'Evaluation interrupted by process restart.',
+                    completed_at = ?
+                WHERE status = 'running'
+                """,
+                (now,),
+            )
             await connection.execute("PRAGMA optimize")
             await connection.commit()
 
@@ -158,6 +204,13 @@ class ReviewRepository:
         for name, definition in REVIEW_COLUMN_MIGRATIONS.items():
             if name not in existing:
                 await connection.execute(f"ALTER TABLE review_runs ADD COLUMN {name} {definition}")
+
+    async def _migrate_job_columns(self, connection: aiosqlite.Connection) -> None:
+        cursor = await connection.execute("PRAGMA table_info(review_jobs)")
+        existing = {row[1] for row in await cursor.fetchall()}
+        for name, definition in JOB_COLUMN_MIGRATIONS.items():
+            if name not in existing:
+                await connection.execute(f"ALTER TABLE review_jobs ADD COLUMN {name} {definition}")
 
     async def ping(self) -> bool:
         try:
@@ -331,9 +384,10 @@ class ReviewRepository:
                     """
                     INSERT INTO review_jobs (
                         id, idempotency_key, delivery_id, repository, pr_number, pr_url, head_sha,
-                        installation_id, status, attempts, max_attempts, available_at, locked_at,
-                        error_message, review_id, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        installation_id, correlation_id, status, attempts, max_attempts,
+                        available_at,
+                        locked_at, error_message, review_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     self._job_values(job),
                 )
@@ -459,6 +513,58 @@ class ReviewRepository:
                 """
             )
             return (await cursor.fetchone())[0]
+
+    async def create_evaluation_run(self, run: EvaluationRun) -> EvaluationRun:
+        async with aiosqlite.connect(self.database_path) as connection:
+            await connection.execute(
+                """
+                INSERT INTO evaluation_runs (
+                    id, status, dataset_version, model, prompt_version, case_count,
+                    completed_cases, true_positives, false_positives, false_negatives,
+                    invalid_findings, accepted_findings, precision, recall, invalid_line_rate,
+                    input_tokens, output_tokens, latency_ms, estimated_cost_usd, results_json,
+                    error_message, created_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                self._evaluation_values(run),
+            )
+            await connection.commit()
+        return run
+
+    async def save_evaluation_run(self, run: EvaluationRun) -> EvaluationRun:
+        async with aiosqlite.connect(self.database_path) as connection:
+            await connection.execute(
+                """
+                UPDATE evaluation_runs SET
+                    status = ?, dataset_version = ?, model = ?, prompt_version = ?,
+                    case_count = ?, completed_cases = ?, true_positives = ?,
+                    false_positives = ?, false_negatives = ?, invalid_findings = ?,
+                    accepted_findings = ?, precision = ?, recall = ?, invalid_line_rate = ?,
+                    input_tokens = ?, output_tokens = ?, latency_ms = ?, estimated_cost_usd = ?,
+                    results_json = ?, error_message = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    *self._evaluation_values(run)[1:-2],
+                    run.completed_at.isoformat() if run.completed_at else None,
+                    run.id,
+                ),
+            )
+            await connection.commit()
+        return run
+
+    async def list_evaluation_runs(self, limit: int = 20) -> EvaluationRunList:
+        async with aiosqlite.connect(self.database_path) as connection:
+            connection.row_factory = aiosqlite.Row
+            cursor = await connection.execute(
+                "SELECT * FROM evaluation_runs ORDER BY created_at DESC LIMIT ?", (limit,)
+            )
+            rows = await cursor.fetchall()
+            count_cursor = await connection.execute("SELECT COUNT(*) FROM evaluation_runs")
+            total = (await count_cursor.fetchone())[0]
+        return EvaluationRunList(
+            items=[self._evaluation_from_row(row) for row in rows], total=total
+        )
 
     async def _update_job(
         self,
@@ -721,6 +827,7 @@ class ReviewRepository:
             job.pr_url,
             job.head_sha,
             job.installation_id,
+            job.correlation_id,
             job.status.value,
             job.attempts,
             job.max_attempts,
@@ -743,6 +850,7 @@ class ReviewRepository:
             pr_url=row["pr_url"],
             head_sha=row["head_sha"],
             installation_id=row["installation_id"],
+            correlation_id=(row["correlation_id"] if "correlation_id" in set(row.keys()) else None),
             status=JobStatus(row["status"]),
             attempts=row["attempts"],
             max_attempts=row["max_attempts"],
@@ -752,4 +860,62 @@ class ReviewRepository:
             review_id=row["review_id"],
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _evaluation_values(run: EvaluationRun) -> tuple[object, ...]:
+        return (
+            run.id,
+            run.status.value,
+            run.dataset_version,
+            run.model,
+            run.prompt_version,
+            run.case_count,
+            run.completed_cases,
+            run.true_positives,
+            run.false_positives,
+            run.false_negatives,
+            run.invalid_findings,
+            run.accepted_findings,
+            run.precision,
+            run.recall,
+            run.invalid_line_rate,
+            run.input_tokens,
+            run.output_tokens,
+            run.latency_ms,
+            run.estimated_cost_usd,
+            json.dumps([result.model_dump(mode="json") for result in run.results]),
+            run.error_message,
+            run.created_at.isoformat(),
+            run.completed_at.isoformat() if run.completed_at else None,
+        )
+
+    @staticmethod
+    def _evaluation_from_row(row: aiosqlite.Row) -> EvaluationRun:
+        return EvaluationRun(
+            id=row["id"],
+            status=EvaluationStatus(row["status"]),
+            dataset_version=row["dataset_version"],
+            model=row["model"],
+            prompt_version=row["prompt_version"],
+            case_count=row["case_count"],
+            completed_cases=row["completed_cases"],
+            true_positives=row["true_positives"],
+            false_positives=row["false_positives"],
+            false_negatives=row["false_negatives"],
+            invalid_findings=row["invalid_findings"],
+            accepted_findings=row["accepted_findings"],
+            precision=row["precision"],
+            recall=row["recall"],
+            invalid_line_rate=row["invalid_line_rate"],
+            input_tokens=row["input_tokens"],
+            output_tokens=row["output_tokens"],
+            latency_ms=row["latency_ms"],
+            estimated_cost_usd=row["estimated_cost_usd"],
+            results=json.loads(row["results_json"]),
+            error_message=row["error_message"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            completed_at=(
+                datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None
+            ),
         )
