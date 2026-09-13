@@ -1,93 +1,80 @@
-from httpx import ASGITransport, AsyncClient
-from mergescope.core.config import Settings, get_settings
-from mergescope.main import app
+from conftest import sign_in
 
 
-async def test_health_config_history_and_built_frontend_are_available() -> None:
-    async with app.router.lifespan_context(app):
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
-            health = await client.get("/api/health")
-            config = await client.get("/api/config")
-            reviews = await client.get("/api/reviews")
-            documents = await client.get("/api/knowledge/documents")
-            jobs = await client.get("/api/jobs")
-            policies = await client.get("/api/policies")
-            evaluation_dataset = await client.get("/api/evaluations/dataset")
-            evaluation_runs = await client.get("/api/evaluations/runs")
-            correlated = await client.get(
-                "/api/health", headers={"X-Request-ID": "phase4-test-request"}
-            )
-            demo = await client.post("/api/reviews/manual", json={"demo_mode": True})
-            publish_without_confirmation = await client.post(
-                f"/api/reviews/{demo.json()['id']}/publish", json={"confirm": False}
-            )
-            preview = await client.get(f"/api/reviews/{demo.json()['id']}/publication-preview")
-            frontend = await client.get("/")
+async def test_private_endpoints_require_login(auth_app):
+    _, client, _ = auth_app
+    assert (await client.get("/api/health")).json() == {"status": "ok"}
+    for path in [
+        "readiness",
+        "config",
+        "reviews",
+        "jobs",
+        "policies",
+        "knowledge/documents",
+        "evaluations/dataset",
+        "evaluations/runs",
+        "reviews/missing/publication-preview",
+    ]:
+        response = await client.get(f"/api/{path}")
+        assert response.status_code == 401, path
+        assert response.headers["cache-control"] == "no-store"
+    response = await client.post("/api/reviews/manual", json={"demo_mode": True})
+    assert response.status_code == 401
 
-    assert health.status_code == 200
-    assert health.json()["database"] == "connected"
-    assert config.status_code == 200
-    assert "openai_api_key" not in config.json()
-    assert "github_token" not in config.json()
-    assert "publish_confirmation_token" not in config.json()
-    assert "evaluation_run_token" not in config.json()
-    assert reviews.status_code == 200
-    assert documents.status_code == 200
-    assert jobs.status_code == 200
-    assert policies.status_code == 200
-    assert evaluation_dataset.status_code == 200
-    assert evaluation_dataset.json()["case_count"] == 6
-    assert evaluation_runs.status_code == 200
-    assert correlated.headers["X-Request-ID"] == "phase4-test-request"
+
+async def test_signed_in_dashboard_and_demo(auth_app):
+    _, client, _ = auth_app
+    headers = await sign_in(client)
+    for path in [
+        "readiness",
+        "config",
+        "reviews",
+        "jobs",
+        "policies",
+        "knowledge/documents",
+        "evaluations/dataset",
+        "evaluations/runs",
+    ]:
+        response = await client.get(f"/api/{path}")
+        assert response.status_code == 200, response.text
+        assert "test-secret" not in response.text
+    demo = await client.post("/api/reviews/manual", json={"demo_mode": True}, headers=headers)
     assert demo.status_code == 201
-    assert demo.json()["demo_mode"] is True
-    assert demo.json()["result"]["rejected_issue_count"] == 0
-    assert publish_without_confirmation.status_code == 422
-    assert preview.status_code == 200
-    assert preview.json()["can_publish"] is False
-    assert frontend.status_code == 200
-    assert "MergeScope AI" in frontend.text
-
-
-async def test_publish_endpoint_requires_operator_token() -> None:
-    configured = Settings(
-        github_publishing_enabled=True,
-        publish_confirmation_token="correct-operator-token",
+    review_id = demo.json()["id"]
+    preview = await client.get(f"/api/reviews/{review_id}/publication-preview")
+    assert preview.status_code == 200 and not preview.json()["can_publish"]
+    invalid = await client.post(
+        f"/api/reviews/{review_id}/publish", json={"confirm": False}, headers=headers
     )
-    app.dependency_overrides[get_settings] = lambda: configured
-    try:
-        async with app.router.lifespan_context(app):
-            transport = ASGITransport(app=app)
-            async with AsyncClient(transport=transport, base_url="http://test") as client:
-                demo = await client.post("/api/reviews/manual", json={"demo_mode": True})
-                response = await client.post(
-                    f"/api/reviews/{demo.json()['id']}/publish",
-                    json={"confirm": True},
-                    headers={"X-MergeScope-Publish-Token": "wrong-token"},
-                )
-    finally:
-        app.dependency_overrides.clear()
-
-    assert response.status_code == 403
-
-
-async def test_evaluation_endpoint_requires_its_own_operator_token() -> None:
-    configured = Settings(
-        openai_api_key="test-key",
-        evaluation_run_token="correct-evaluation-token",
+    assert invalid.status_code == 422
+    # A signed-in publication needs no shared operator token; demo safeguard still applies.
+    blocked = await client.post(
+        f"/api/reviews/{review_id}/publish", json={"confirm": True}, headers=headers
     )
-    app.dependency_overrides[get_settings] = lambda: configured
-    try:
-        async with app.router.lifespan_context(app):
-            transport = ASGITransport(app=app)
-            async with AsyncClient(transport=transport, base_url="http://test") as client:
-                response = await client.post(
-                    "/api/evaluations/runs",
-                    json={"confirm_cost": True},
-                    headers={"X-MergeScope-Evaluation-Token": "wrong-token"},
-                )
-    finally:
-        app.dependency_overrides.clear()
+    assert blocked.status_code == 409 and "Demo" in blocked.text
+    assert (await client.get("/")).status_code == 200
 
+
+async def test_csrf_origin_and_evaluation_operator_protection(auth_app):
+    _, client, _ = auth_app
+    headers = await sign_in(client)
+    for bad_headers in [
+        {},
+        {**headers, "Origin": "https://attacker.example"},
+        {**headers, "X-MergeScope-CSRF": "wrong"},
+    ]:
+        for path, payload in [
+            ("reviews/manual", {"demo_mode": True}),
+            ("reviews/missing/publish", {"confirm": True}),
+            ("auth/logout", {}),
+        ]:
+            assert (
+                await client.post(f"/api/{path}", json=payload, headers=bad_headers)
+            ).status_code == 403
+    response = await client.post(
+        "/api/evaluations/runs",
+        json={"confirm_cost": True},
+        headers={**headers, "X-MergeScope-Evaluation-Token": "wrong"},
+    )
     assert response.status_code == 403
+    assert (await client.post("/api/webhooks/github", headers=headers)).status_code == 410

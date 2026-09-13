@@ -107,6 +107,11 @@ class ReviewService:
                 )
             self._apply_pull_request(run, pull_request)
             run.cache_key = self._cache_key(pull_request, policy)
+            documents = await self.repository.list_documents()
+            context_key = ":".join(sorted(document.id for document in documents.items))
+            run.cache_key = hashlib.sha256(
+                f"{run.cache_key}:{context_key}:{run.ticket_reference or ''}".encode()
+            ).hexdigest()
 
             if not request.demo_mode and not request.force_rereview:
                 cached = await self.repository.find_cached(run.cache_key)

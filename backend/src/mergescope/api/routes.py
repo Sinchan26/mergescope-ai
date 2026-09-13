@@ -14,6 +14,7 @@ from fastapi import (
     status,
 )
 
+from mergescope.api.workspace import workspace
 from mergescope.core.config import Settings, get_settings
 from mergescope.db.repository import ReviewRepository
 from mergescope.domain.models import (
@@ -44,19 +45,19 @@ from mergescope.services.publication import PublicationError, PublicationService
 from mergescope.services.reviews import ReviewService
 from mergescope.services.webhooks import WebhookError, WebhookService
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(workspace)])
 
 
 def get_repository(request: Request) -> ReviewRepository:
-    return request.app.state.repository
+    return request.state.repository
 
 
 def get_review_service(request: Request) -> ReviewService:
-    return request.app.state.review_service
+    return request.state.review_service
 
 
 def get_knowledge_service(request: Request) -> KnowledgeService:
-    return request.app.state.knowledge_service
+    return request.state.knowledge_service
 
 
 def get_webhook_service(request: Request) -> WebhookService:
@@ -64,11 +65,11 @@ def get_webhook_service(request: Request) -> WebhookService:
 
 
 def get_publication_service(request: Request) -> PublicationService:
-    return request.app.state.publication_service
+    return request.state.publication_service
 
 
 def get_evaluation_service(request: Request) -> EvaluationService:
-    return request.app.state.evaluation_service
+    return request.state.evaluation_service
 
 
 def get_policy_registry(request: Request) -> PolicyRegistry:
@@ -85,7 +86,7 @@ PolicyRegistryDep = Annotated[PolicyRegistry, Depends(get_policy_registry)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 
 
-@router.get("/health", response_model=HealthResponse)
+@router.get("/readiness", response_model=HealthResponse)
 async def health(
     repository: RepositoryDep,
     settings: SettingsDep,
@@ -97,14 +98,12 @@ async def health(
         status="ready" if database_ready else "degraded",
         database="connected" if database_ready else "unavailable",
         openai_configured=bool(settings.openai_api_key),
-        github_configured=bool(settings.github_token or settings.github_app_ready),
-        github_app_configured=settings.github_app_ready,
-        webhook_configured=bool(settings.github_webhook_secret),
-        worker_enabled=settings.worker_enabled,
+        github_configured=settings.github_login_ready,
+        github_app_configured=settings.github_login_ready,
+        webhook_configured=False,
+        worker_enabled=False,
         pending_jobs=await repository.pending_job_count() if database_ready else 0,
-        publishing_enabled=bool(
-            settings.github_publishing_enabled and settings.publish_confirmation_token
-        ),
+        publishing_enabled=bool(settings.github_publishing_enabled and settings.github_login_ready),
         allowlist_enabled=policies.allowlist_enabled,
         policy_file_configured=policies.policy_file_configured,
         evaluation_dataset_ready=evaluations.dataset_ready,
@@ -133,13 +132,11 @@ async def public_config(
         openai_model=settings.openai_model,
         embedding_model=settings.openai_embedding_model,
         openai_configured=bool(settings.openai_api_key),
-        github_configured=bool(settings.github_token or settings.github_app_ready),
-        github_app_configured=settings.github_app_ready,
-        webhook_configured=bool(settings.github_webhook_secret),
-        worker_enabled=settings.worker_enabled,
-        publishing_enabled=bool(
-            settings.github_publishing_enabled and settings.publish_confirmation_token
-        ),
+        github_configured=settings.github_login_ready,
+        github_app_configured=settings.github_login_ready,
+        webhook_configured=False,
+        worker_enabled=False,
+        publishing_enabled=bool(settings.github_publishing_enabled and settings.github_login_ready),
         allowlist_enabled=policy_summary.allowlist_enabled,
         allowed_repository_count=policy_summary.allowed_repository_count,
         policy_file_configured=policy_summary.policy_file_configured,
@@ -194,22 +191,15 @@ async def publish_review(
     payload: PublishReviewRequest,
     service: PublicationServiceDep,
     settings: SettingsDep,
-    publish_token: Annotated[str | None, Header(alias="X-MergeScope-Publish-Token")] = None,
 ) -> PublicationResult:
     if payload.confirm is not True:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Confirmation required."
         )
-    expected = settings.publish_confirmation_token
-    if not settings.github_publishing_enabled or not expected:
+    if not settings.github_publishing_enabled:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="GitHub publishing is not fully enabled on this server.",
-        )
-    if publish_token is None or not secrets.compare_digest(publish_token, expected):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="The publication confirmation token is missing or incorrect.",
         )
     try:
         return await service.publish(review_id)

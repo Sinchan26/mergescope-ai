@@ -13,27 +13,41 @@ import type {
   ReviewRun,
 } from "./types";
 
+let csrfToken = "";
+export const setCsrfToken = (value: string) => { csrfToken = value; };
+export interface SessionInfo { user: { id: number; login: string }; csrf_token: string }
+export interface AccessibleRepository { id: number; full_name: string; private: boolean }
+export class ApiError extends Error {
+  constructor(message: string, public status: number) { super(message); }
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const isFormData = options?.body instanceof FormData;
   const response = await fetch(path, {
     ...options,
-    headers: isFormData
-      ? options?.headers
-      : {
-          "Content-Type": "application/json",
-          ...options?.headers,
-        },
+    credentials: "same-origin",
+    cache: "no-store",
+    headers: {
+      ...(!isFormData ? { "Content-Type": "application/json" } : {}),
+      ...(options?.method && options.method !== "GET" ? { "X-MergeScope-CSRF": csrfToken } : {}),
+      ...options?.headers,
+    },
   });
   if (!response.ok) {
     const payload = (await response.json().catch(() => null)) as { detail?: string } | null;
-    throw new Error(payload?.detail ?? `Request failed with status ${response.status}`);
+    if (response.status === 401 && path !== "/api/auth/me") window.dispatchEvent(new Event("mergescope:expired"));
+    throw new ApiError(payload?.detail ?? `Request failed with status ${response.status}`, response.status);
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
 export const api = {
-  health: () => request<Health>("/api/health"),
+  authStatus: () => request<{ configured: boolean; install_url: string | null }>("/api/auth/status"),
+  me: () => request<SessionInfo>("/api/auth/me"),
+  repositories: () => request<{ items: AccessibleRepository[] }>("/api/auth/repositories"),
+  logout: () => request<void>("/api/auth/logout", { method: "POST" }),
+  health: () => request<Health>("/api/readiness"),
   config: () => request<PublicConfig>("/api/config"),
   reviews: () => request<ReviewList>("/api/reviews?limit=50"),
   jobs: () => request<ReviewJobList>("/api/jobs?limit=50"),
@@ -77,10 +91,9 @@ export const api = {
     request<void>(`/api/knowledge/documents/${documentId}`, { method: "DELETE" }),
   publicationPreview: (reviewId: string) =>
     request<PublicationPreview>(`/api/reviews/${reviewId}/publication-preview`),
-  publishReview: (reviewId: string, confirmationToken: string) =>
+  publishReview: (reviewId: string) =>
     request<PublicationResult>(`/api/reviews/${reviewId}/publish`, {
       method: "POST",
-      headers: { "X-MergeScope-Publish-Token": confirmationToken },
       body: JSON.stringify({ confirm: true }),
     }),
 };

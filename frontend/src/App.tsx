@@ -24,6 +24,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { api } from "./api";
+import type { AccessibleRepository } from "./api";
 import { EvaluationCenter } from "./components/EvaluationCenter";
 import { KnowledgeBase } from "./components/KnowledgeBase";
 import { ReviewInspector } from "./components/ReviewInspector";
@@ -50,7 +51,13 @@ const formatDate = (value: string) =>
     minute: "2-digit",
   }).format(new Date(value));
 
-function App() {
+function App({ user, repositories, installUrl, onLogout, authError }: {
+  user: { id: number; login: string };
+  repositories: AccessibleRepository[];
+  installUrl: string | null;
+  onLogout: () => void;
+  authError: string | null;
+}) {
   const [view, setView] = useState<View>("overview");
   const [health, setHealth] = useState<Health | null>(null);
   const [config, setConfig] = useState<PublicConfig | null>(null);
@@ -230,8 +237,8 @@ function App() {
           <button className="nav-item" onClick={() => { navigate("overview"); requestAnimationFrame(() => document.getElementById("history")?.scrollIntoView()); }}><History size={18} />Review history</button>
         </nav>
         <div className="sidebar-section">
-          <p>Phase 4</p>
-          <div className="phase-progress"><span aria-hidden="true" /><small>4 of 4 · Operational readiness</small></div>
+          <p>Signed-in workspace</p>
+          <div className="account-panel"><strong>@{user.login}</strong><small>GitHub ID {user.id}</small><button className="secondary-button" type="button" onClick={onLogout}>Sign out</button></div>
         </div>
         <div className="sidebar-status">
           <div className="status-line"><span className={`health-dot ${health?.status === "ready" ? "online" : ""}`} /><span>{health?.status === "ready" ? "API operational" : "API unavailable"}</span></div>
@@ -251,6 +258,7 @@ function App() {
         </header>
 
         {error && <div className="error-banner" role="alert"><XCircle size={18} /><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError(null)}><X size={17} /></button></div>}
+        {authError && <p className="error-banner" role="alert">{authError}</p>}
         {notice && <div className="success-banner" role="status"><CheckCircle2 size={18} /><span>{notice}</span><button aria-label="Dismiss message" onClick={() => setNotice(null)}><X size={17} /></button></div>}
 
         {view === "knowledge" ? (
@@ -275,15 +283,17 @@ function App() {
                 <span className="dry-run-badge"><ShieldCheck size={15} /> Dry run enforced</span>
               </div>
               <form onSubmit={submitReview}>
+                <label className="field field-wide"><span>Repository access</span><select className="repository-select" aria-describedby="repository-help" defaultValue="" onChange={(event) => { if (event.target.value) setPrUrl(`https://github.com/${event.target.value}/pull/`); }}><option value="">Choose a repository, or paste its PR link below</option>{repositories.map((repo) => <option key={repo.id} value={repo.full_name}>{repo.full_name}{repo.private ? " · private" : ""}</option>)}</select><small id="repository-help">{repositories.length} accessible repositories. {installUrl && <a href={installUrl} target="_blank" rel="noreferrer">Manage App repository access</a>} Reload this page after changing installations.</small></label>
+                {repositories.length === 0 && <p className="field-wide form-note" role="status">No repositories connected. Install the GitHub App on a repository you can access, then reload. You can still explore the demo.</p>}
                 <label className="field field-wide"><span>GitHub pull request URL</span><div className="input-wrap"><GitPullRequest size={18} /><input type="url" required value={prUrl} onChange={(event) => setPrUrl(event.target.value)} placeholder="https://github.com/owner/repository/pull/123" autoComplete="url" /></div></label>
                 <label className="field"><span>Ticket reference <small>Optional</small></span><div className="input-wrap"><CircleDot size={18} /><input type="text" maxLength={100} value={ticketReference} onChange={(event) => setTicketReference(event.target.value)} placeholder="LOCAL-101" /></div></label>
-                <button className="primary-button" type="submit" disabled={submitting || !config?.openai_configured}>{submitting ? <LoaderCircle size={18} className="spin" /> : <Sparkles size={18} />}{submitting ? "Agents reviewing…" : "Run agent review"}</button>
+                <button className="primary-button" type="submit" disabled={submitting || !config?.openai_configured || repositories.length === 0}>{submitting ? <LoaderCircle size={18} className="spin" /> : <Sparkles size={18} />}{submitting ? "Agents reviewing…" : "Run agent review"}</button>
               </form>
               <div className="review-options">
                 <label className="checkbox-option"><input type="checkbox" checked={forceRereview} onChange={(event) => setForceRereview(event.target.checked)} /><span>Force re-review and ignore cache</span></label>
                 {config?.demo_mode_allowed && <button type="button" className="secondary-button" disabled={submitting} onClick={() => void executeReview(true)}><Activity size={16} />Run deterministic demo</button>}
               </div>
-              <p className="form-note">No GitHub comments are created. Cache identity includes the PR head, model, prompt, and resolved policy.</p>
+              <p className="form-note">Analysis creates no GitHub comments. Preview and confirm publication separately; comments are posted as your signed-in GitHub account.</p>
             </section>
 
             <section className="metrics-grid" aria-label="Review summary">

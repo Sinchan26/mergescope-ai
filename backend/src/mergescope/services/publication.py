@@ -1,5 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
+from fastapi import HTTPException
+
 from mergescope.db.repository import ReviewRepository
 from mergescope.domain.models import (
     PublicationComment,
@@ -29,12 +31,14 @@ class PublicationService:
         app_auth: GitHubAppAuth | None,
         publishing_enabled: bool,
         policies: PolicyRegistry | None = None,
+        user_auth=None,
     ) -> None:
         self.repository = repository
         self.github = github
         self.app_auth = app_auth
         self.publishing_enabled = publishing_enabled
         self.policies = policies
+        self.user_auth = user_auth
 
     def preview(self, review: ReviewRun) -> PublicationPreview:
         reasons: list[str] = []
@@ -44,7 +48,7 @@ class PublicationService:
             reasons.append("Demo reviews cannot be published.")
         if not self.publishing_enabled:
             reasons.append("GitHub publishing is disabled by server configuration.")
-        if self.app_auth is None:
+        if self.app_auth is None and self.user_auth is None:
             reasons.append("GitHub App authentication is not configured.")
         if not review.repository or review.pr_number is None or not review.head_sha:
             reasons.append("The review is missing GitHub pull-request metadata.")
@@ -94,7 +98,11 @@ class PublicationService:
         preview = self.preview(review)
         if not preview.can_publish:
             raise PublicationError(" ".join(preview.blocking_reasons))
-        if self.app_auth is None or not review.repository or review.pr_number is None:
+        if (
+            (self.app_auth is None and self.user_auth is None)
+            or not review.repository
+            or review.pr_number is None
+        ):
             raise PublicationError("GitHub App authentication is not configured.")
 
         claimed = await self.repository.begin_publication(review.id)
@@ -116,7 +124,7 @@ class PublicationService:
 
             owner, repository = review.repository.split("/", 1)
             marker = self._marker(review)
-            existing = await self.app_auth.request_as_installation(
+            existing = await self._request(
                 "GET",
                 f"/repos/{owner}/{repository}/pulls/{review.pr_number}/reviews",
                 owner=owner,
@@ -142,7 +150,7 @@ class PublicationService:
                 "event": "COMMENT",
                 "comments": [comment.model_dump() for comment in preview.comments],
             }
-            created = await self.app_auth.request_as_installation(
+            created = await self._request(
                 "POST",
                 f"/repos/{owner}/{repository}/pulls/{review.pr_number}/reviews",
                 owner=owner,
@@ -154,10 +162,19 @@ class PublicationService:
             )
         except PublicationError:
             raise
+        except HTTPException:
+            review.publication_status = PublicationStatus.failed
+            await self.repository.save(review)
+            raise
         except (GitHubAppError, GitHubError, KeyError, TypeError, ValueError) as exc:
             review.publication_status = PublicationStatus.failed
             await self.repository.save(review)
             raise PublicationError(str(exc)) from exc
+
+    async def _request(self, method, path, **kwargs):
+        if self.user_auth is not None:
+            return await self.user_auth.request_as_user(method, path, **kwargs)
+        return await self.app_auth.request_as_installation(method, path, **kwargs)
 
     async def _mark_published(
         self, review: ReviewRun, github_review_id: int, message: str

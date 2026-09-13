@@ -25,6 +25,20 @@
 }
 
 * { box-sizing: border-box; }
+.auth-page { min-height: 100dvh; display: grid; place-items: center; padding: 32px 20px; }
+.auth-card { width: min(100%, 600px); padding: clamp(24px, 5vw, 48px); }
+.auth-card h1 { font-size: clamp(23px, 4vw, 32px); line-height: 1.45; letter-spacing: -.04em; }
+.auth-card > p, .auth-card small { color: var(--muted); line-height: 1.7; }
+.auth-card small { display: block; margin-top: 24px; }
+.auth-assurance { display: flex; align-items: flex-start; gap: 14px; margin: 28px 0; padding: 18px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-soft); }
+.auth-assurance svg { flex-shrink: 0; color: var(--green); }
+.auth-assurance p { margin: 0; color: var(--muted); line-height: 1.6; }
+.auth-login { text-decoration: none; width: 100%; min-height: 48px; }
+.auth-setup { padding: 16px; border: 1px solid var(--border-strong); border-radius: 8px; overflow-wrap: anywhere; }
+.account-panel { display: grid; gap: 12px; padding: 12px; overflow-wrap: anywhere; }
+.account-panel small { color: var(--muted); }
+.repository-select { min-height: 46px; width: 100%; min-width: 0; padding: 12px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface-soft); color: var(--text); font: inherit; }
+.field > small { color: var(--muted); line-height: 1.7; }
 html { scroll-behavior: smooth; }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--bg); }
 button, input, dialog { font: inherit; }

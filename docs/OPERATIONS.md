@@ -1,8 +1,8 @@
 # Evaluation and operations
 
-Phase 4 keeps MergeScope Docker-free and single-server. FastAPI, the background worker, the built
-React application, and SQLite run as one process. Use a test repository until its evaluation results
-are acceptable.
+MergeScope remains Docker-free. In v0.5, FastAPI, the built React application, and SQLite run in one
+application process; the webhook worker is disabled. Follow [GitHub login setup](github-login.md)
+for authentication, per-user storage/backups, and HTTPS deployment. Use a test repository first.
 
 ## Repository boundary
 
@@ -12,9 +12,9 @@ Set a comma-separated allowlist. Matching is case-insensitive and exact.
 ALLOWED_REPOSITORIES=your-org/test-repository,your-org/another-repository
 ```
 
-An empty value preserves local Phase 1–3 behavior and allows all repositories, but the Evaluation
-page reports that boundary as open. Disallowed manual reviews fail before GitHub or OpenAI access;
-valid signed webhooks return an ignored receipt without creating a job.
+An empty value adds no server restriction, but GitHub user/App installation permissions are always
+enforced. `ALLOWED_GITHUB_USER_IDS` must explicitly enable each user who can use the server's
+OpenAI key. Webhooks are disabled regardless of legacy configuration.
 
 ## Review policies
 
@@ -46,8 +46,9 @@ The selected model and resolved policy fingerprint are part of review-cache and 
 identity. After a model or policy change and API restart, the same pull-request head is reviewed
 under a new identity rather than reusing results produced by the previous controls.
 
-Comment publication requires all three locks: the global publishing flag, the publication operator
-token, and `publish_comments: true` in the resolved repository policy.
+Comment publication requires a GitHub user session, CSRF/Origin checks, literal confirmation,
+the global publishing flag, and `publish_comments: true` in the resolved repository policy.
+The former shared publication operator token is no longer used.
 
 ## Labeled evaluation
 
@@ -93,6 +94,9 @@ logged.
 ## Online SQLite backups
 
 The backup command uses SQLite's online backup API, so the API can remain running:
+
+For v0.5, run it for each `data/mergescope-users/<id>.db` and protect the auth DB/key as described
+in the [storage guide](github-login.md#storage-and-upgrade). The old root DB is legacy data only.
 
 ```bash
 uv run python scripts/backup_sqlite.py --retain 7

@@ -25,7 +25,6 @@ export function PublicationPanel({ review, onPublished }: PublicationPanelProps)
   const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(true);
   const [publishing, setPublishing] = useState(false);
-  const [confirmationToken, setConfirmationToken] = useState("");
   const [error, setError] = useState<string | null>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
 
@@ -47,9 +46,8 @@ export function PublicationPanel({ review, onPublished }: PublicationPanelProps)
     setPublishing(true);
     setError(null);
     try {
-      const result = await api.publishReview(review.id, confirmationToken);
+      const result = await api.publishReview(review.id);
       onPublished(result);
-      setConfirmationToken("");
       closeConfirmation();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "GitHub publication failed.");
@@ -107,8 +105,8 @@ export function PublicationPanel({ review, onPublished }: PublicationPanelProps)
       <dialog className="publish-dialog" ref={dialogRef} onCancel={closeConfirmation}>
         <div className="dialog-header"><div><p className="eyebrow">External write confirmation</p><h2>Publish to GitHub?</h2></div><button className="icon-button" type="button" aria-label="Close confirmation" onClick={closeConfirmation}><X size={18} /></button></div>
         <div className="dialog-warning"><ShieldCheck size={21} /><p>This creates one GitHub review on commit <code>{preview?.commit_sha?.slice(0, 12)}</code> with {preview?.comments.length ?? 0} inline comments. MergeScope will recheck the PR head first.</p></div>
-        <label className="dialog-token-field" htmlFor="publish-confirmation-token"><span>Publication confirmation token</span><input id="publish-confirmation-token" type="password" value={confirmationToken} onChange={(event) => setConfirmationToken(event.target.value)} autoComplete="off" aria-describedby="publish-token-help" required /><small id="publish-token-help">Enter the operator token configured on the server. It is used once and not stored.</small></label>
-        <div className="dialog-actions"><button className="secondary-button" type="button" onClick={closeConfirmation}>Cancel</button><button className="primary-button danger-confirm" type="button" disabled={publishing || !confirmationToken} onClick={() => void publish()}>{publishing ? <LoaderCircle className="spin" size={17} /> : <Send size={17} />}{publishing ? "Publishing…" : "Confirm publication"}</button></div>
+        <p className="muted-copy">This review will be posted as your signed-in GitHub account. Your session authorizes it—no publication token is needed.</p>
+        <div className="dialog-actions"><button className="secondary-button" type="button" onClick={closeConfirmation}>Cancel</button><button className="primary-button danger-confirm" type="button" disabled={publishing} onClick={() => void publish()}>{publishing ? <LoaderCircle className="spin" size={17} /> : <Send size={17} />}{publishing ? "Publishing…" : "Confirm publication"}</button></div>
       </dialog>
     </div>
   );

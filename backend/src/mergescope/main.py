@@ -1,7 +1,6 @@
-import asyncio
 import logging
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from time import perf_counter
 
 from fastapi import FastAPI, Request
@@ -10,55 +9,34 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from mergescope.agents.review_graph import ReviewOrchestrator
+from mergescope.api.auth_routes import router as auth_router
 from mergescope.api.routes import router
+from mergescope.api.workspace import initialize_workspaces
 from mergescope.core.config import get_settings
 from mergescope.core.logging import bind_correlation_id, configure_logging
-from mergescope.db.repository import ReviewRepository
 from mergescope.integrations.embeddings import OpenAIEmbedder
-from mergescope.integrations.github import GitHubClient
-from mergescope.integrations.github_app import GitHubAppAuth
 from mergescope.integrations.openai_review import OpenAIReviewClient
-from mergescope.services.evaluations import EvaluationService
-from mergescope.services.knowledge import KnowledgeRetriever, KnowledgeService
+from mergescope.services.auth import AuthService
 from mergescope.services.policies import PolicyRegistry
-from mergescope.services.publication import PublicationService
-from mergescope.services.reviews import ReviewService
-from mergescope.services.webhooks import WebhookService
-from mergescope.services.worker import ReviewWorker
 
 settings = get_settings()
 configure_logging(settings.log_level, json_logs=settings.log_json)
 logger = logging.getLogger(__name__)
+# Our middleware logs paths without OAuth callback query strings. Uvicorn's
+# default access logger would log the one-time authorization code and state.
+logging.getLogger("uvicorn.access").disabled = True
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    repository = ReviewRepository(settings.resolved_database_path)
-    await repository.initialize()
-    policies = PolicyRegistry(
+    app.state.auth = AuthService(settings)
+    await app.state.auth.initialize()
+    initialize_workspaces(app)
+    app.state.policy_registry = PolicyRegistry(
         path=settings.resolved_review_policies_path,
         allowed_repositories=settings.allowed_repository_set,
     )
-    private_key = settings.resolved_github_private_key
-    app_auth = (
-        GitHubAppAuth(
-            app_id=settings.github_app_id,
-            private_key=private_key,
-            api_url=settings.github_api_url,
-            api_version=settings.github_api_version,
-            timeout_seconds=settings.github_timeout_seconds,
-        )
-        if settings.github_app_id and private_key
-        else None
-    )
-    github = GitHubClient(
-        api_url=settings.github_api_url,
-        token=settings.github_token,
-        timeout_seconds=settings.github_timeout_seconds,
-        app_auth=app_auth,
-        api_version=settings.github_api_version,
-    )
-    embedder = (
+    app.state.embedder = (
         OpenAIEmbedder(
             api_key=settings.openai_api_key,
             model=settings.openai_embedding_model,
@@ -76,81 +54,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.openai_api_key
         else None
     )
-    knowledge_service = KnowledgeService(
-        repository=repository,
-        embedder=embedder,
-        embedding_model=settings.openai_embedding_model,
-        max_document_bytes=settings.max_document_bytes,
-    )
-    retriever = KnowledgeRetriever(repository=repository, embedder=embedder)
-    app.state.repository = repository
-    app.state.knowledge_service = knowledge_service
-    orchestrator = ReviewOrchestrator(review_client) if review_client else None
-    review_service = ReviewService(
-        repository=repository,
-        github=github,
-        orchestrator=orchestrator,
-        retriever=retriever,
-        model=settings.openai_model,
-        dry_run_only=settings.dry_run_only,
-        demo_mode_allowed=settings.demo_mode_allowed,
-        prompt_version=settings.prompt_version,
-        policies=policies,
-    )
-    worker = ReviewWorker(
-        repository=repository,
-        review_service=review_service,
-        poll_seconds=settings.worker_poll_seconds,
-        lease_seconds=settings.worker_lease_seconds,
-    )
-    app.state.review_service = review_service
-    app.state.policy_registry = policies
-    app.state.review_worker = worker
-    app.state.webhook_service = WebhookService(
-        repository=repository,
-        secret=settings.github_webhook_secret,
-        prompt_version=settings.prompt_version,
-        max_attempts=settings.worker_max_attempts,
-        max_body_bytes=settings.webhook_max_bytes,
-        notify_worker=worker.notify,
-        policies=policies,
-        model=settings.openai_model,
-    )
-    app.state.publication_service = PublicationService(
-        repository=repository,
-        github=github,
-        app_auth=app_auth,
-        publishing_enabled=bool(
-            settings.github_publishing_enabled and settings.publish_confirmation_token
-        ),
-        policies=policies,
-    )
-    app.state.evaluation_service = EvaluationService(
-        repository=repository,
-        orchestrator=orchestrator,
-        dataset_path=settings.resolved_evaluation_dataset_path,
-        model=settings.openai_model,
-        prompt_version=settings.prompt_version,
-        input_cost_per_million=settings.openai_input_cost_per_million,
-        output_cost_per_million=settings.openai_output_cost_per_million,
-    )
-    worker_task = asyncio.create_task(worker.run()) if settings.worker_enabled else None
+    app.state.orchestrator = ReviewOrchestrator(review_client) if review_client else None
+    # Do not open the legacy DB, initialize bot credentials, or start a webhook
+    # worker. Browser requests only enter per-user workspaces.
     try:
         yield
     finally:
-        if worker_task:
-            worker_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await worker_task
-        await github.close()
-        if app_auth:
-            await app_auth.close()
+        await app.state.auth.close()
 
 
 app = FastAPI(
     title=settings.app_name,
-    version="0.4.0",
-    description="Grounded, Docker-free pull-request review and GitHub workflow API",
+    version="0.5.0",
+    description="User-scoped, Docker-free pull-request reviews",
     lifespan=lifespan,
 )
 
@@ -159,33 +75,49 @@ app = FastAPI(
 async def request_logging(request: Request, call_next):
     started = perf_counter()
     with bind_correlation_id(request.headers.get("X-Request-ID")) as request_id:
-        context = {
-            "event": "http_request",
-            "method": request.method,
-            "path": request.url.path,
-        }
+        context = {"event": "http_request", "method": request.method, "path": request.url.path}
         try:
             response = await call_next(request)
         except Exception:
             logger.exception("HTTP request failed.", extra=context)
             raise
-        duration_ms = round((perf_counter() - started) * 1_000)
         response.headers["X-Request-ID"] = request_id
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        if request.url.path.startswith(settings.api_prefix):
+            response.headers["Cache-Control"] = "no-store"
         logger.info(
             "HTTP request completed.",
-            extra={**context, "status_code": response.status_code, "duration_ms": duration_ms},
+            extra={
+                **context,
+                "status_code": response.status_code,
+                "duration_ms": round((perf_counter() - started) * 1000),
+            },
         )
         return response
 
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[settings.app_origin.rstrip("/")],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=[
+        "Content-Type",
+        "X-MergeScope-CSRF",
+        "X-MergeScope-Evaluation-Token",
+        "X-Request-ID",
+    ],
 )
+app.include_router(auth_router, prefix=settings.api_prefix)
 app.include_router(router, prefix=settings.api_prefix)
+
+
+@app.get(f"{settings.api_prefix}/health")
+async def health():
+    return {"status": "ok"}
+
 
 frontend_dist = settings.resolved_frontend_dist_path
 if frontend_dist.joinpath("index.html").exists():

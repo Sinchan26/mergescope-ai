@@ -1,5 +1,9 @@
 # GitHub App setup
 
+> Historical Phase 3 webhook design, inactive in v0.5. For the current signed-in,
+> manual-only workflow use [GitHub login setup](github-login.md). Do not configure a
+> tunnel, webhook, installation private key, or shared publication token for v0.5.
+
 Use a test repository for the first end-to-end run. GitHub publication is disabled by default.
 
 ## 1. Create the app
