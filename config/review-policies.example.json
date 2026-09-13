@@ -1,0 +1,19 @@
+{
+  "default": {
+    "require_ticket_reference": false,
+    "security_review": "conditional",
+    "testing_review": true,
+    "blocking_severities": ["critical", "high"],
+    "blocking_categories": ["security", "correctness"],
+    "minimum_confidence": 0.65,
+    "max_inline_comments": 25,
+    "publish_comments": false
+  },
+  "repositories": {
+    "your-org/test-repository": {
+      "require_ticket_reference": true,
+      "security_review": "always",
+      "publish_comments": true
+    }
+  }
+}
