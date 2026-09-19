@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { LoaderCircle, SearchCode, ShieldCheck } from "lucide-react";
+import { ArrowRight, GitPullRequest, Github, LoaderCircle, SearchCode, ShieldCheck, Sparkles } from "lucide-react";
 import App from "../App";
 import { api, ApiError, setCsrfToken } from "../api";
 import type { AccessibleRepository, SessionInfo } from "../api";
@@ -46,16 +46,31 @@ export function AuthGate() {
 
   if (session) return <App key={session.user.id} user={session.user} repositories={repos} installUrl={status?.install_url ?? null} onLogout={() => void logout()} authError={error} />;
   return <main className="auth-page">
+    <div className="ambient-backdrop" aria-hidden="true">
+      <span className="ambient-orb ambient-orb-one" />
+      <span className="ambient-orb ambient-orb-two" />
+      <span className="ambient-grid" />
+    </div>
     <section className="auth-card panel" aria-labelledby="auth-heading">
-      <div className="brand"><div className="brand-mark"><SearchCode size={22} aria-hidden="true" /></div><div><strong>MergeScope</strong><span>Your code. A second perspective.</span></div></div>
-      <p className="eyebrow">A private review workspace</p>
-      <h1 id="auth-heading">Sign in. Scope your repos.<br />Review with confidence.</h1>
-      <p>Paste a pull request link, inspect your agents’ findings, then choose which review to publish to GitHub.</p>
-      <div className="auth-assurance"><ShieldCheck size={22} aria-hidden="true" /><p>Only repositories available to your account and the GitHub App are in scope. Reviews and documents stay in your own workspace.</p></div>
-      {error && <p className="error-banner" role="alert">{error}</p>}
-      {loading ? <p role="status"><LoaderCircle size={18} className="spin" aria-hidden="true" /> Checking your session…</p> : status?.configured ? <a className="primary-button auth-login" href="/api/auth/login">Continue with GitHub</a> : <div className="auth-setup" role="status"><strong>One-time server setup needed</strong><p>Configure the GitHub App client ID, client secret, and encryption key. Follow <code>docs/github-login.md</code>, then restart the backend.</p></div>}
-      {!loading && <button className="text-button" type="button" onClick={() => window.location.reload()}>Reload connection</button>}
-      <small>No GitHub password is stored here. Nothing is posted without your confirmation.</small>
+      <div className="auth-copy">
+        <div className="brand"><div className="brand-mark"><SearchCode size={22} aria-hidden="true" /></div><div><strong>MergeScope</strong><span>Your code. A second perspective.</span></div></div>
+        <p className="eyebrow"><Sparkles size={13} aria-hidden="true" /> AI-assisted pull request review</p>
+        <h1 id="auth-heading">Review what matters.<br /><span>Ship with clarity.</span></h1>
+        <p className="auth-intro">Bring a pull request, let focused agents inspect the diff, and stay in control of what gets published.</p>
+        <div className="auth-features" aria-label="Product capabilities">
+          <div><GitPullRequest size={18} aria-hidden="true" /><span><strong>Diff grounded</strong><small>Findings tied to changed lines</small></span></div>
+          <div><ShieldCheck size={18} aria-hidden="true" /><span><strong>Human controlled</strong><small>Preview before publishing</small></span></div>
+        </div>
+      </div>
+      <div className="auth-action">
+        <div className="auth-action-heading"><span className="status-pulse" aria-hidden="true" /><span>Secure workspace access</span></div>
+        <h2>Continue to your review console</h2>
+        <div className="auth-assurance"><ShieldCheck size={21} aria-hidden="true" /><p>Only repositories available to your account and the installed GitHub App are in scope.</p></div>
+        {error && <p className="error-banner" role="alert">{error}</p>}
+        {loading ? <p className="auth-loading" role="status"><LoaderCircle size={18} className="spin" aria-hidden="true" /> Checking your session…</p> : status?.configured ? <a className="primary-button auth-login" href="/api/auth/login"><Github size={19} aria-hidden="true" />Continue with GitHub<ArrowRight size={18} aria-hidden="true" /></a> : <div className="auth-setup" role="status"><strong>One-time server setup needed</strong><p>Configure the GitHub App client ID, client secret, and encryption key. Follow <code>docs/github-login.md</code>, then restart the backend.</p></div>}
+        {!loading && <button className="text-button" type="button" onClick={() => window.location.reload()}>Reload connection</button>}
+        <small>No GitHub password is stored. Nothing is posted without your confirmation.</small>
+      </div>
     </section>
   </main>;
 }
