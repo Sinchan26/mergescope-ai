@@ -221,6 +221,11 @@ function App({ user, repositories, installUrl, onLogout, authError }: {
 
   return (
     <div className="app-shell">
+      <div className="ambient-backdrop" aria-hidden="true">
+        <span className="ambient-orb ambient-orb-one" />
+        <span className="ambient-orb ambient-orb-two" />
+        <span className="ambient-grid" />
+      </div>
       <a className="skip-link" href="#main-content">Skip to main content</a>
       <aside className={`sidebar ${mobileNavOpen ? "sidebar-open" : ""}`}>
         <div className="brand">
@@ -261,6 +266,7 @@ function App({ user, repositories, installUrl, onLogout, authError }: {
         {authError && <p className="error-banner" role="alert">{authError}</p>}
         {notice && <div className="success-banner" role="status"><CheckCircle2 size={18} /><span>{notice}</span><button aria-label="Dismiss message" onClick={() => setNotice(null)}><X size={17} /></button></div>}
 
+        <div className="view-stage" key={view}>
         {view === "knowledge" ? (
           <KnowledgeBase documents={documents} config={config} uploading={uploading} onUpload={uploadDocument} onDelete={deleteDocument} />
         ) : view === "automation" ? (
@@ -326,6 +332,7 @@ function App({ user, repositories, installUrl, onLogout, authError }: {
             </section>
           </>
         )}
+        </div>
       </main>
     </div>
   );
